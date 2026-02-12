@@ -118,6 +118,18 @@ async function main() {
     env: env.NODE_ENV,
   }));
 
+  // ─── Start Server FIRST (so health check responds immediately) ───────
+  try {
+    await app.listen({ port: env.PORT, host: env.HOST });
+    console.log(`\n🍁 Maple Exchange server running on http://${env.HOST}:${env.PORT}`);
+    console.log(`   Environment: ${env.NODE_ENV}`);
+    console.log(`   WebSocket:   ws://${env.HOST}:${env.PORT}/ws`);
+    console.log(`   Health:      http://${env.HOST}:${env.PORT}/api/health\n`);
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+
   // ─── Seed Wallet Counters + Platform User + Staking Products ────────
   try {
     await db.transaction(async (tx) => {
@@ -207,18 +219,6 @@ async function main() {
       app.log.error({ err }, 'Error checking wallet pool status');
     }
   }, 10 * 60 * 1000); // every 10 minutes
-
-  // ─── Start Server ─────────────────────────────────────────────────────
-  try {
-    await app.listen({ port: env.PORT, host: env.HOST });
-    console.log(`\n🍁 Maple Exchange server running on http://${env.HOST}:${env.PORT}`);
-    console.log(`   Environment: ${env.NODE_ENV}`);
-    console.log(`   WebSocket:   ws://${env.HOST}:${env.PORT}/ws`);
-    console.log(`   Health:      http://${env.HOST}:${env.PORT}/api/health\n`);
-  } catch (err) {
-    app.log.error(err);
-    process.exit(1);
-  }
 
   // Graceful shutdown
   const shutdown = async () => {

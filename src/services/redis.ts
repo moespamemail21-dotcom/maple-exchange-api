@@ -8,7 +8,7 @@ const redisOpts: any = {
 
 // Render external Redis uses rediss:// (TLS)
 if (env.REDIS_URL.startsWith('rediss://')) {
-  redisOpts.tls = {};
+  redisOpts.tls = { rejectUnauthorized: false };
 }
 
 export const redis = new Redis(env.REDIS_URL, redisOpts);

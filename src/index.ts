@@ -119,16 +119,22 @@ async function main() {
   }));
 
   // ─── Seed Wallet Counters + Platform User + Staking Products ────────
-  await db.transaction(async (tx) => {
-    await seedWalletCounters(tx);
-  });
-  await ensurePlatformUser();
-  await seedStakingProducts();
-  await seedNotifications();
+  try {
+    await db.transaction(async (tx) => {
+      await seedWalletCounters(tx);
+    });
+    await ensurePlatformUser();
+    await seedStakingProducts();
+    await seedNotifications();
+  } catch (err) {
+    app.log.error({ err }, 'Error during seed operations (non-fatal)');
+  }
 
   // ─── Background Jobs ──────────────────────────────────────────────────
-  // Price feed: await first fetch so prices are ready before accepting requests
-  await fetchPrices();
+  // Price feed: try first fetch, but don't crash if API is down
+  try { await fetchPrices(); } catch (err) {
+    app.log.error({ err }, 'Initial price fetch failed (will retry)');
+  }
   const priceTimer = startPriceFeed(30_000);
 
   // Expired trades: check every 60 seconds
@@ -179,7 +185,9 @@ async function main() {
   }, 10_000);
 
   // Market stats: fetch on startup + every hour
-  await fetchMarketStats();
+  try { await fetchMarketStats(); } catch (err) {
+    app.log.error({ err }, 'Initial market stats fetch failed (will retry)');
+  }
   const marketStatsTimer = startMarketStatsFeed(3600_000);
 
   // News feed: fetch on startup + every hour (with 2s delay between coins)
@@ -234,4 +242,7 @@ async function main() {
   process.on('SIGTERM', shutdown);
 }
 
-main();
+main().catch((err) => {
+  console.error('FATAL startup error:', err);
+  process.exit(1);
+});

@@ -1,16 +1,20 @@
 import Redis from 'ioredis';
 import { env } from '../config/env.js';
 
-export const redis = new Redis(env.REDIS_URL, {
+const redisOpts: any = {
   maxRetriesPerRequest: null, // required for BullMQ
   enableReadyCheck: false,
-});
+};
+
+// Render external Redis uses rediss:// (TLS)
+if (env.REDIS_URL.startsWith('rediss://')) {
+  redisOpts.tls = {};
+}
+
+export const redis = new Redis(env.REDIS_URL, redisOpts);
 
 // Separate connection for subscriptions
-export const redisSub = new Redis(env.REDIS_URL, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: false,
-});
+export const redisSub = new Redis(env.REDIS_URL, redisOpts);
 
 // Order book keys
 export const KEYS = {

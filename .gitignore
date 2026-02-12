@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.*
+uploads/
+drizzle/*.sql
+*.tgz
+.DS_Store

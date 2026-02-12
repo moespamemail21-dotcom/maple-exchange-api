@@ -1,0 +1,50 @@
+{
+  "name": "maple-exchange-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio",
+    "wallets:generate": "tsx scripts/generate-wallets.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.986.0",
+    "@fastify/cors": "^11.0.0",
+    "@fastify/jwt": "^9.0.1",
+    "@fastify/multipart": "^9.4.0",
+    "@fastify/rate-limit": "^10.2.1",
+    "@fastify/websocket": "^11.0.1",
+    "@noble/hashes": "^2.0.1",
+    "@scure/bip32": "^2.0.1",
+    "@scure/bip39": "^2.0.1",
+    "@scure/btc-signer": "^2.0.1",
+    "@solana/web3.js": "^1.98.4",
+    "axios": "^1.7.9",
+    "bcrypt": "^5.1.1",
+    "bullmq": "^5.34.8",
+    "cheerio": "^1.2.0",
+    "decimal.js": "^10.6.0",
+    "drizzle-orm": "^0.38.4",
+    "ethers": "^6.16.0",
+    "fastify": "^5.2.1",
+    "ioredis": "^5.4.2",
+    "nanoid": "^5.0.9",
+    "postgres": "^3.4.5",
+    "xrpl": "^4.5.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "^5.0.2",
+    "@types/node": "^22.10.5",
+    "@types/ws": "^8.18.1",
+    "drizzle-kit": "^0.30.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

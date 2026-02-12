@@ -26,7 +26,7 @@
     "@scure/btc-signer": "^2.0.1",
     "@solana/web3.js": "^1.98.4",
     "axios": "^1.7.9",
-    "bcrypt": "^5.1.1",
+    "bcryptjs": "^3.0.3",
     "bullmq": "^5.34.8",
     "cheerio": "^1.2.0",
     "decimal.js": "^10.6.0",
@@ -40,7 +40,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@types/bcrypt": "^5.0.2",
+    "@types/bcryptjs": "^2.4.6",
     "@types/node": "^22.10.5",
     "@types/ws": "^8.18.1",
     "drizzle-kit": "^0.30.4",

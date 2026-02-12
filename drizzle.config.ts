@@ -6,6 +6,5 @@ export default defineConfig({
   dialect: 'postgresql',
   dbCredentials: {
     url: process.env.DATABASE_URL || 'postgresql://localhost:5432/maple_exchange',
-    ssl: process.env.NODE_ENV === 'production' ? 'require' : false,
   },
 });

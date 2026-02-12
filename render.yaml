@@ -1,0 +1,40 @@
+databases:
+  - name: maple-exchange-db
+    plan: starter
+    databaseName: maple_exchange
+    user: maple
+
+services:
+  - type: redis
+    name: maple-exchange-redis
+    plan: starter
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList: []
+
+  - type: web
+    name: maple-exchange-api
+    runtime: node
+    plan: starter
+    repo: https://github.com/moespamemail21-dotcom/maple-exchange-api
+    branch: main
+    buildCommand: npm install && npm run build && npm run db:push
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: maple-exchange-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: maple-exchange-redis
+          type: redis
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: WALLET_ENCRYPTION_KEY
+        generateValue: true
+      - key: STORAGE_BACKEND
+        value: local

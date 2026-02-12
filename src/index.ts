@@ -43,7 +43,7 @@ async function main() {
 
   // ─── Plugins ──────────────────────────────────────────────────────────
   await app.register(cors, {
-    origin: env.NODE_ENV === 'development' ? true : ['https://mapleexchange.ca'],
+    origin: env.NODE_ENV === 'development' ? true : ['https://mapleexchange.ca', 'https://maplecx.app', 'https://maple-exchange-api.onrender.com'],
     credentials: true,
   });
 

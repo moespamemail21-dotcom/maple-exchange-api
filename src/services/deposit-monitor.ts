@@ -1,9 +1,11 @@
 import { db } from '../db/index.js';
 import { wallets, deposits, notifications } from '../db/schema.js';
-import { eq, and, sql, isNotNull } from 'drizzle-orm';
+import { eq, and, or, sql, isNotNull } from 'drizzle-orm';
 import { mutateBalance } from './balance.js';
 import { CHAINS, REQUIRED_CONFIRMATIONS, CHAIN_ASSETS, MIN_DEPOSIT, type Chain } from './wallet.js';
+import { redis } from './redis.js';
 import { env } from '../config/env.js';
+import { logger } from '../config/logger.js';
 import Decimal from 'decimal.js';
 import axios from 'axios';
 import { ethers } from 'ethers';
@@ -24,6 +26,7 @@ interface WalletInfo {
 
 let scanTimer: ReturnType<typeof setInterval> | null = null;
 let ethLastScannedBlock: number | null = null;
+let isScanning = false;
 
 // ERC-20 Transfer(address,address,uint256) event topic
 const ERC20_TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
@@ -31,17 +34,30 @@ const ERC20_TRANSFER_TOPIC = ethers.id('Transfer(address,address,uint256)');
 // ─── Start / Stop ───────────────────────────────────────────────────────────
 
 export function startDepositMonitor(): ReturnType<typeof setInterval> {
-  console.log(`  Deposit Monitor: scanning every ${env.DEPOSIT_SCAN_INTERVAL_MS / 1000}s`);
+  logger.info(`  Deposit Monitor: scanning every ${env.DEPOSIT_SCAN_INTERVAL_MS / 1000}s`);
 
-  scanForDeposits().catch((err) => {
-    console.error('Deposit scan error:', err);
-  });
+  // Run initial scan with isScanning guard to prevent overlap with first interval
+  isScanning = true;
+  scanForDeposits()
+    .catch((err) => {
+      logger.error({ err }, 'Deposit scan error');
+    })
+    .finally(() => {
+      isScanning = false;
+    });
 
   scanTimer = setInterval(async () => {
+    if (isScanning) {
+      logger.debug('Deposit scan still in progress, skipping');
+      return;
+    }
     try {
+      isScanning = true;
       await scanForDeposits();
     } catch (err) {
-      console.error('Deposit scan error:', err);
+      logger.error({ err }, 'Deposit scan error');
+    } finally {
+      isScanning = false;
     }
   }, env.DEPOSIT_SCAN_INTERVAL_MS);
 
@@ -89,7 +105,7 @@ async function scanForDeposits() {
     try {
       await scanChain(chain, chainWallets);
     } catch (err) {
-      console.error(`[Deposit Monitor] ${chain} scan failed:`, err instanceof Error ? err.message : err);
+      logger.error({ chain, err: err instanceof Error ? err.message : err }, 'chain scan failed');
     }
   }
 }
@@ -124,7 +140,7 @@ async function scanBitcoin(chainWallets: WalletInfo[]) {
     const { data } = await axios.get(`${env.MEMPOOL_API_URL}/blocks/tip/height`, { timeout: 10000 });
     tipHeight = Number(data);
   } catch {
-    console.error('[Deposit Monitor] bitcoin: failed to get tip height');
+    logger.error('[Deposit Monitor] bitcoin: failed to get tip height');
     return;
   }
 
@@ -172,12 +188,12 @@ async function scanBitcoin(chainWallets: WalletInfo[]) {
       // Rate limit: 1s between address queries
       await sleep(1000);
     } catch (err) {
-      console.error(`[Deposit Monitor] bitcoin: error scanning ${wallet.address}:`, err instanceof Error ? err.message : err);
+      logger.error({ chain: 'bitcoin', address: wallet.address, err: err instanceof Error ? err.message : err }, 'error scanning address');
     }
   }
 
   if (newDeposits > 0) {
-    console.log(`[Deposit Monitor] bitcoin: ${newDeposits} new deposit(s) detected`);
+    logger.info({ chain: 'bitcoin', count: newDeposits }, 'new deposits detected');
   }
 }
 
@@ -193,7 +209,7 @@ async function scanLitecoin(chainWallets: WalletInfo[]) {
     const { data } = await axios.get(`${env.LTC_API_URL}/blocks/tip/height`, { timeout: 10000 });
     tipHeight = Number(data);
   } catch {
-    console.error('[Deposit Monitor] litecoin: failed to get tip height');
+    logger.error('[Deposit Monitor] litecoin: failed to get tip height');
     return;
   }
 
@@ -239,12 +255,12 @@ async function scanLitecoin(chainWallets: WalletInfo[]) {
 
       await sleep(1000);
     } catch (err) {
-      console.error(`[Deposit Monitor] litecoin: error scanning ${wallet.address}:`, err instanceof Error ? err.message : err);
+      logger.error({ chain: 'litecoin', address: wallet.address, err: err instanceof Error ? err.message : err }, 'error scanning address');
     }
   }
 
   if (newDeposits > 0) {
-    console.log(`[Deposit Monitor] litecoin: ${newDeposits} new deposit(s) detected`);
+    logger.info({ chain: 'litecoin', count: newDeposits }, 'new deposits detected');
   }
 }
 
@@ -258,17 +274,19 @@ async function scanEthereum(chainWallets: WalletInfo[]) {
   const provider = new ethers.JsonRpcProvider(env.ETH_RPC_URL);
   const currentBlock = await provider.getBlockNumber();
 
-  // Initialize last scanned block on first run
+  // Initialize last scanned block: restore from Redis or default to recent blocks.
+  // Use 500 blocks (≈1.7 hours) as the catchup window to handle server restarts/downtime.
   if (ethLastScannedBlock === null) {
-    ethLastScannedBlock = currentBlock - 50;
+    const stored = await redis.get('deposit:eth:lastBlock');
+    ethLastScannedBlock = stored ? Number(stored) : currentBlock - 500;
   }
 
   // Don't re-scan already scanned blocks
   if (currentBlock <= ethLastScannedBlock) return;
 
-  // Cap at 50 blocks per cycle to avoid overloading
+  // Cap at 100 blocks per cycle to avoid overloading (catches up faster after downtime)
   const fromBlock = ethLastScannedBlock + 1;
-  const toBlock = Math.min(currentBlock, fromBlock + 49);
+  const toBlock = Math.min(currentBlock, fromBlock + 99);
 
   // Build address lookup set (lowercased for comparison)
   const addressSet = new Set<string>();
@@ -310,7 +328,7 @@ async function scanEthereum(chainWallets: WalletInfo[]) {
         newDeposits++;
       }
     } catch (err) {
-      console.error(`[Deposit Monitor] ethereum: error scanning block ${blockNum}:`, err instanceof Error ? err.message : err);
+      logger.error({ chain: 'ethereum', blockNum, err: err instanceof Error ? err.message : err }, 'error scanning block');
     }
   }
 
@@ -368,13 +386,14 @@ async function scanEthereum(chainWallets: WalletInfo[]) {
       }
     }
   } catch (err) {
-    console.error('[Deposit Monitor] ethereum: error scanning LINK transfers:', err instanceof Error ? err.message : err);
+    logger.error({ chain: 'ethereum', asset: 'LINK', err: err instanceof Error ? err.message : err }, 'error scanning LINK transfers');
   }
 
   ethLastScannedBlock = toBlock;
+  await redis.set('deposit:eth:lastBlock', String(toBlock));
 
   if (newDeposits > 0) {
-    console.log(`[Deposit Monitor] ethereum: ${newDeposits} new deposit(s) detected (blocks ${fromBlock}-${toBlock})`);
+    logger.info({ chain: 'ethereum', count: newDeposits, fromBlock, toBlock }, 'new deposits detected');
   }
 }
 
@@ -413,11 +432,14 @@ async function scanXRP(chainWallets: WalletInfo[]) {
           // Must be incoming (Destination is our address)
           if (tx.Destination !== wallet.address) continue;
 
-          // Check destination tag if wallet has one
-          if (wallet.destinationTag) {
-            const expectedTag = Number(wallet.destinationTag);
-            if (tx.DestinationTag !== expectedTag) continue;
+          // Check destination tag — XRP wallets MUST have one (shared address model).
+          // Skip wallets with null tag as a safety guard (should never happen in production).
+          if (!wallet.destinationTag) {
+            logger.warn({ walletId: wallet.id }, 'XRP wallet missing destination tag — skipping');
+            continue;
           }
+          const expectedTag = Number(wallet.destinationTag);
+          if (tx.DestinationTag !== expectedTag) continue;
 
           // Only handle native XRP (Amount is string of drops)
           if (typeof tx.Amount !== 'string') continue;
@@ -441,15 +463,15 @@ async function scanXRP(chainWallets: WalletInfo[]) {
       } catch (err: any) {
         // actNotFound means account has no on-ledger existence yet (no XRP received)
         if (err?.data?.error === 'actNotFound') continue;
-        console.error(`[Deposit Monitor] xrp: error scanning ${wallet.address}:`, err instanceof Error ? err.message : err);
+        logger.error({ chain: 'xrp', address: wallet.address, err: err instanceof Error ? err.message : err }, 'error scanning address');
       }
     }
 
     if (newDeposits > 0) {
-      console.log(`[Deposit Monitor] xrp: ${newDeposits} new deposit(s) detected`);
+      logger.info({ chain: 'xrp', count: newDeposits }, 'new deposits detected');
     }
   } finally {
-    try { await client.disconnect(); } catch { /* ignore */ }
+    try { await client.disconnect(); } catch { /* cleanup */ }
   }
 }
 
@@ -528,12 +550,12 @@ async function scanSolana(chainWallets: WalletInfo[]) {
         newDeposits++;
       }
     } catch (err) {
-      console.error(`[Deposit Monitor] solana: error scanning ${wallet.address}:`, err instanceof Error ? err.message : err);
+      logger.error({ chain: 'solana', address: wallet.address, err: err instanceof Error ? err.message : err }, 'error scanning address');
     }
   }
 
   if (newDeposits > 0) {
-    console.log(`[Deposit Monitor] solana: ${newDeposits} new deposit(s) detected`);
+    logger.info({ chain: 'solana', count: newDeposits }, 'new deposits detected');
   }
 }
 
@@ -545,7 +567,7 @@ async function updatePendingConfirmations() {
   const pendingDeposits = await db
     .select()
     .from(deposits)
-    .where(eq(deposits.status, 'pending'));
+    .where(or(eq(deposits.status, 'pending'), eq(deposits.status, 'confirming')));
 
   if (pendingDeposits.length === 0) return;
 
@@ -567,10 +589,12 @@ async function updatePendingConfirmations() {
             ? Number(tipHeight) - (txData.status.block_height as number) + 1
             : 0;
           await updateDepositConfirmations(deposit, confs);
-        } catch { /* skip individual tx errors */ }
+        } catch (err) {
+          logger.debug({ err, txHash: deposit.txHash, chain: 'bitcoin' }, 'skipping tx confirmation check');
+        }
       }
-    } catch {
-      console.error('[Deposit Monitor] bitcoin: failed to update confirmations');
+    } catch (err) {
+      logger.error({ err, chain: 'bitcoin' }, 'failed to update confirmations');
     }
   }
 
@@ -585,10 +609,12 @@ async function updatePendingConfirmations() {
             ? Number(tipHeight) - (txData.status.block_height as number) + 1
             : 0;
           await updateDepositConfirmations(deposit, confs);
-        } catch { /* skip individual tx errors */ }
+        } catch (err) {
+          logger.debug({ err, txHash: deposit.txHash, chain: 'litecoin' }, 'skipping tx confirmation check');
+        }
       }
-    } catch {
-      console.error('[Deposit Monitor] litecoin: failed to update confirmations');
+    } catch (err) {
+      logger.error({ err, chain: 'litecoin' }, 'failed to update confirmations');
     }
   }
 
@@ -604,10 +630,12 @@ async function updatePendingConfirmations() {
           if (!receipt) continue;
           const confs = currentBlock - receipt.blockNumber + 1;
           await updateDepositConfirmations(deposit, confs);
-        } catch { /* skip */ }
+        } catch (err) {
+          logger.debug({ err, txHash: deposit.txHash, chain: 'ethereum' }, 'skipping tx confirmation check');
+        }
       }
-    } catch {
-      console.error('[Deposit Monitor] ethereum: failed to update confirmations');
+    } catch (err) {
+      logger.error({ err, chain: 'ethereum' }, 'failed to update confirmations');
     }
   }
 
@@ -632,8 +660,8 @@ async function updatePendingConfirmations() {
           : (status.confirmations ?? 0);
         await updateDepositConfirmations(solPending[i], confs);
       }
-    } catch {
-      console.error('[Deposit Monitor] solana: failed to update confirmations');
+    } catch (err) {
+      logger.error({ err, chain: 'solana' }, 'failed to update confirmations');
     }
   }
 }
@@ -647,13 +675,37 @@ async function updateDepositConfirmations(
 ) {
   if (newConfirmations <= deposit.confirmations) return; // No change
 
-  await db
-    .update(deposits)
-    .set({ confirmations: newConfirmations })
-    .where(eq(deposits.id, deposit.id));
-
   if (newConfirmations >= deposit.requiredConfirmations) {
-    await creditDeposit(deposit.id);
+    // Fully confirmed — atomically transition to 'confirmed' only if still pending/confirming.
+    // This prevents overwriting 'credited' status if creditDeposit already ran (e.g. from processNewDeposit).
+    const [updated] = await db
+      .update(deposits)
+      .set({ confirmations: newConfirmations, status: 'confirmed', confirmedAt: new Date() })
+      .where(and(
+        eq(deposits.id, deposit.id),
+        sql`${deposits.status} IN ('pending', 'confirming')`,
+      ))
+      .returning({ id: deposits.id });
+
+    if (updated) {
+      logger.info({ depositId: deposit.id, asset: deposit.asset, amount: deposit.amount, confirmations: newConfirmations }, 'deposit confirmed');
+      await creditDeposit(deposit.id);
+    }
+  } else if (newConfirmations > 0 && deposit.status === 'pending') {
+    // Partial confirmations — transition from 'pending' to 'confirming'
+    await db
+      .update(deposits)
+      .set({ confirmations: newConfirmations, status: 'confirming' })
+      .where(and(eq(deposits.id, deposit.id), eq(deposits.status, 'pending')));
+  } else {
+    // Update confirmation count only (don't touch terminal statuses)
+    await db
+      .update(deposits)
+      .set({ confirmations: newConfirmations })
+      .where(and(
+        eq(deposits.id, deposit.id),
+        sql`${deposits.status} IN ('pending', 'confirming')`,
+      ));
   }
 }
 
@@ -707,30 +759,54 @@ export async function processNewDeposit(params: {
       idempotencyKey: `deposit:${txHash}:${chain}:pending`,
       note: `Deposit detected: ${amount} ${asset} (${confirmations}/${required} confirmations)`,
     });
+
+    logger.info({ depositId: txHash, asset, amount, txHash }, 'deposit detected');
   });
+
+  // If confirmations already meet the threshold (e.g. XRP validated = final),
+  // transition through confirmed → credited immediately.
+  // The WHERE status guard prevents resetting an already-credited deposit back to confirmed.
+  if (confirmations >= required) {
+    const [inserted] = await db
+      .select({ id: deposits.id })
+      .from(deposits)
+      .where(and(eq(deposits.txHash, txHash), eq(deposits.chain, chain)));
+    if (inserted) {
+      const [updated] = await db
+        .update(deposits)
+        .set({ status: 'confirmed', confirmedAt: new Date() })
+        .where(and(
+          eq(deposits.id, inserted.id),
+          sql`${deposits.status} IN ('pending', 'confirming')`,
+        ))
+        .returning({ id: deposits.id });
+      if (updated) {
+        await creditDeposit(updated.id);
+      }
+    }
+  }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  CREDIT DEPOSIT (moves pending → available when fully confirmed)
+//  CREDIT DEPOSIT (moves confirmed → credited, adds to available balance)
 // ═════════════════════════════════════════════════════════════════════════════
 
 async function creditDeposit(depositId: string) {
   await db.transaction(async (tx) => {
     // Lock and get the deposit
     const result = await tx.execute(
-      sql`SELECT * FROM deposits WHERE id = ${depositId} AND status = 'pending' FOR UPDATE`,
+      sql`SELECT * FROM deposits WHERE id = ${depositId} AND status = 'confirmed' FOR UPDATE`,
     ) as any;
 
     const rows = Array.isArray(result) ? result : result?.rows ?? [];
     if (rows.length === 0) return;
     const deposit = rows[0] as any;
 
-    // Move from pending → credited
+    // Move from confirmed → credited
     await tx
       .update(deposits)
       .set({
         status: 'credited',
-        confirmedAt: new Date(),
         creditedAt: new Date(),
       })
       .where(eq(deposits.id, depositId));
@@ -758,6 +834,8 @@ async function creditDeposit(depositId: string) {
       depositId,
       note: `Deposit credited: ${deposit.amount} ${deposit.asset}`,
     });
+
+    logger.info({ depositId, userId: deposit.user_id, asset: deposit.asset, amount: deposit.amount }, 'deposit credited to balance');
 
     // Create notification for user
     await tx.insert(notifications).values({

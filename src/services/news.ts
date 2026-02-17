@@ -1,3 +1,4 @@
+import { logger } from '../config/logger.js';
 import axios from 'axios';
 import { load } from 'cheerio';
 import { redis } from './redis.js';
@@ -82,7 +83,7 @@ async function fetchNewsForCoin(symbol: string): Promise<NewsArticle[]> {
 
     return articles;
   } catch (err) {
-    console.error(`News fetch failed for ${symbol}:`, err instanceof Error ? err.message : err);
+    logger.error({ err, symbol }, 'News fetch failed');
     return memoryCache.get(symbol) ?? [];
   }
 }

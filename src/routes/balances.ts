@@ -2,6 +2,9 @@ import { FastifyInstance } from 'fastify';
 import { authGuard } from '../middleware/auth.js';
 import { getUserBalances, getUserBalance, getLedgerEntries } from '../services/balance.js';
 import { getPrice } from '../services/price.js';
+import { count, eq, and } from 'drizzle-orm';
+import { db } from '../db/index.js';
+import { balanceLedger } from '../db/schema.js';
 
 export async function balanceRoutes(app: FastifyInstance) {
   // ─── Get All Balances + CAD Values ──────────────────────────────────
@@ -65,15 +68,31 @@ export async function balanceRoutes(app: FastifyInstance) {
   });
 
   // ─── Get Ledger (Audit Trail) ───────────────────────────────────────
-  app.get('/api/balances/ledger', { preHandler: [authGuard] }, async (request) => {
+  app.get('/api/balances/ledger', {
+    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    preHandler: [authGuard],
+  }, async (request) => {
     const query = request.query as { asset?: string; limit?: string; offset?: string };
+    const limit = Math.min(Number(query.limit) || 50, 200);
+    const offset = Math.min(Math.max(Number(query.offset) || 0, 0), 10_000);
 
     const entries = await getLedgerEntries(request.userId, {
       asset: query.asset?.toUpperCase(),
-      limit: Math.min(Number(query.limit) || 50, 200),
-      offset: Number(query.offset) || 0,
+      limit,
+      offset,
     });
 
-    return { entries };
+    // Count total entries with the same filters
+    const conditions = [eq(balanceLedger.userId, request.userId)];
+    if (query.asset) conditions.push(eq(balanceLedger.asset, query.asset.toUpperCase()));
+
+    const [countResult] = await db
+      .select({ value: count() })
+      .from(balanceLedger)
+      .where(and(...conditions));
+
+    const total = countResult?.value ?? 0;
+
+    return { entries, total, limit, offset };
   });
 }

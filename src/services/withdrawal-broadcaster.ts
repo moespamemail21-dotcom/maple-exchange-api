@@ -4,6 +4,7 @@ import { eq, and, sql } from 'drizzle-orm';
 import { mutateBalance } from './balance.js';
 import { decryptPrivateKey, ASSET_TO_CHAIN, type Chain } from './wallet.js';
 import { env } from '../config/env.js';
+import { logger } from '../config/logger.js';
 import Decimal from 'decimal.js';
 import axios from 'axios';
 import { ethers } from 'ethers';
@@ -26,17 +27,17 @@ const LTC_NETWORK = {
 // ─── Start / Stop ───────────────────────────────────────────────────────────
 
 export function startWithdrawalBroadcaster(): ReturnType<typeof setInterval> {
-  console.log(`  Withdrawal Broadcaster: processing every ${env.WITHDRAWAL_BROADCAST_INTERVAL_MS / 1000}s`);
+  logger.info(`  Withdrawal Broadcaster: processing every ${env.WITHDRAWAL_BROADCAST_INTERVAL_MS / 1000}s`);
 
   processWithdrawals().catch((err) => {
-    console.error('Withdrawal broadcast error:', err);
+    logger.error({ err }, 'Withdrawal broadcast error');
   });
 
   broadcastTimer = setInterval(async () => {
     try {
       await processWithdrawals();
     } catch (err) {
-      console.error('Withdrawal broadcast error:', err);
+      logger.error({ err }, 'Withdrawal broadcast error');
     }
   }, env.WITHDRAWAL_BROADCAST_INTERVAL_MS);
 
@@ -63,13 +64,19 @@ async function processWithdrawals() {
 // ─── Broadcast Approved Withdrawals ─────────────────────────────────────────
 
 async function broadcastApproved() {
-  // Lock and fetch up to 5 approved withdrawals
+  // Atomically claim up to 5 approved withdrawals by setting status='broadcasting'.
+  // This prevents double-broadcast: two concurrent instances can't both claim the same row.
   const result = await db.execute(
-    sql`SELECT * FROM withdrawals
-        WHERE status = 'approved'
-        ORDER BY approved_at ASC
-        LIMIT 5
-        FOR UPDATE SKIP LOCKED`,
+    sql`UPDATE withdrawals
+        SET status = 'broadcasting', broadcast_at = NOW()
+        WHERE id IN (
+          SELECT id FROM withdrawals
+          WHERE status = 'approved'
+          ORDER BY approved_at ASC
+          LIMIT 5
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *`,
   ) as any;
 
   const rows = Array.isArray(result) ? result : result?.rows ?? [];
@@ -77,12 +84,6 @@ async function broadcastApproved() {
 
   for (const withdrawal of rows) {
     try {
-      // Set status to broadcasting
-      await db
-        .update(withdrawals)
-        .set({ status: 'broadcasting', broadcastAt: new Date() })
-        .where(eq(withdrawals.id, withdrawal.id));
-
       // Get user's wallet for this chain
       const chain = withdrawal.chain as Chain;
       const [wallet] = await db
@@ -114,13 +115,21 @@ async function broadcastApproved() {
         .set({ txHash })
         .where(eq(withdrawals.id, withdrawal.id));
 
-      console.log(`[Withdrawal Broadcaster] ${withdrawal.asset}: broadcast ${txHash.slice(0, 16)}... for ${withdrawal.net_amount} ${withdrawal.asset}`);
+      logger.info({ withdrawalId: withdrawal.id, asset: withdrawal.asset, txHash, netAmount: withdrawal.net_amount }, 'withdrawal broadcast');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(`[Withdrawal Broadcaster] Failed to broadcast ${withdrawal.id}:`, message);
+      logger.error({ withdrawalId: withdrawal.id, err: message }, 'withdrawal broadcast failed');
 
       // Refund balance and mark as failed
-      await refundFailedWithdrawal(withdrawal, message);
+      try {
+        await refundFailedWithdrawal(withdrawal, message);
+      } catch (refundErr) {
+        logger.fatal({
+          withdrawalId: withdrawal.id,
+          broadcastError: message,
+          refundError: refundErr instanceof Error ? refundErr.message : String(refundErr),
+        }, 'CRITICAL: Failed to refund failed withdrawal — manual intervention required');
+      }
     }
   }
 }
@@ -201,20 +210,28 @@ async function broadcastUTXO(
   // 3. Calculate output amount in satoshis
   const outputSats = BigInt(new Decimal(params.netAmount).times(1e8).round().toFixed(0));
 
-  // 4. Select UTXOs (simple: sort by value desc, take enough to cover output + estimated fee)
+  // 4. Select UTXOs — use actual vsize estimate from the start to avoid underflow
   const sortedUtxos = utxos.sort((a: any, b: any) => b.value - a.value);
   let totalInput = 0n;
   const selectedUtxos: any[] = [];
-  const estimatedFee = BigInt(feeRate * 250); // Conservative estimate for 1-in-2-out
+
+  // Pre-calculate: estimate fee based on inputs selected so far
+  // SegWit p2wpkh: ~68 vB/input, ~31 vB/output, ~10 vB overhead
+  function estimateFee(numInputs: number): bigint {
+    const vsize = 10 + numInputs * 68 + 2 * 31; // 2 outputs (recipient + change)
+    return BigInt(feeRate * vsize);
+  }
 
   for (const utxo of sortedUtxos) {
     selectedUtxos.push(utxo);
     totalInput += BigInt(utxo.value);
-    if (totalInput >= outputSats + estimatedFee) break;
+    const fee = estimateFee(selectedUtxos.length);
+    if (totalInput >= outputSats + fee) break;
   }
 
-  if (totalInput < outputSats + estimatedFee) {
-    throw new Error(`Insufficient UTXOs: have ${totalInput}, need ${outputSats + estimatedFee}`);
+  const actualFee = estimateFee(selectedUtxos.length);
+  if (totalInput < outputSats + actualFee) {
+    throw new Error(`Insufficient UTXOs: have ${totalInput}, need ${outputSats + actualFee}`);
   }
 
   // 5. Build transaction
@@ -235,9 +252,6 @@ async function broadcastUTXO(
   tx.addOutputAddress(params.toAddress, outputSats, network);
 
   // Change output (back to our address)
-  // First, estimate the actual fee based on transaction size
-  const estimatedVsize = 10 + selectedUtxos.length * 68 + 2 * 31; // rough estimate
-  const actualFee = BigInt(feeRate * estimatedVsize);
   const change = totalInput - outputSats - actualFee;
 
   if (change > 546n) { // dust threshold
@@ -305,11 +319,10 @@ async function broadcastXRP(params: BroadcastParams): Promise<string> {
   try {
     await client.connect();
 
-    // Create wallet from private key
-    const xrpWallet = new XrplWallet(
-      '00' + params.privateKey, // public key placeholder — will be derived
-      params.privateKey,
-    );
+    // Derive compressed secp256k1 public key from private key
+    const privKeyBytes = Buffer.from(params.privateKey, 'hex');
+    const pubKeyHex = Buffer.from(getPubKeyFromPriv(privKeyBytes)).toString('hex').toUpperCase();
+    const xrpWallet = new XrplWallet(pubKeyHex, '00' + params.privateKey.toUpperCase());
 
     // Build payment transaction
     const payment: any = {
@@ -384,11 +397,14 @@ async function checkBroadcasting() {
       const confirmed = await checkConfirmation(withdrawal.chain as Chain, withdrawal.txHash);
       if (!confirmed) continue;
 
-      // Mark as confirmed
-      await db
+      // Mark as confirmed (only if still broadcasting — prevents overwriting admin-cancelled)
+      const [updated] = await db
         .update(withdrawals)
         .set({ status: 'confirmed', confirmedAt: new Date() })
-        .where(eq(withdrawals.id, withdrawal.id));
+        .where(and(eq(withdrawals.id, withdrawal.id), eq(withdrawals.status, 'broadcasting')))
+        .returning({ id: withdrawals.id });
+
+      if (!updated) continue; // Status changed by admin or concurrent process
 
       // Create notification
       await db.insert(notifications).values({
@@ -404,10 +420,10 @@ async function checkBroadcasting() {
         },
       });
 
-      console.log(`[Withdrawal Broadcaster] ${withdrawal.asset}: confirmed ${withdrawal.txHash.slice(0, 16)}...`);
+      logger.info({ withdrawalId: withdrawal.id, asset: withdrawal.asset, txHash: withdrawal.txHash }, 'withdrawal confirmed');
     } catch (err) {
       // Don't fail — just retry next cycle
-      console.error(`[Withdrawal Broadcaster] Error checking confirmation for ${withdrawal.id}:`, err instanceof Error ? err.message : err);
+      logger.error({ withdrawalId: withdrawal.id, err: err instanceof Error ? err.message : err }, 'error checking withdrawal confirmation');
     }
   }
 }
@@ -449,28 +465,48 @@ async function checkSOLConfirmation(signature: string): Promise<boolean> {
 // ─── Failed Withdrawal Refund ───────────────────────────────────────────────
 
 async function refundFailedWithdrawal(withdrawal: any, failureReason: string) {
-  try {
-    await db.transaction(async (tx) => {
-      await tx
-        .update(withdrawals)
-        .set({ status: 'failed', failureReason })
-        .where(eq(withdrawals.id, withdrawal.id));
+  await db.transaction(async (tx) => {
+    // Only transition to 'failed' if still in a pre-terminal state
+    const [updated] = await tx
+      .update(withdrawals)
+      .set({ status: 'failed', failureReason })
+      .where(and(
+        eq(withdrawals.id, withdrawal.id),
+        sql`${withdrawals.status} IN ('approved', 'broadcasting')`,
+      ))
+      .returning({ id: withdrawals.id });
 
-      // Refund the full debited amount (including fee) back to available
-      await mutateBalance(tx, {
-        userId: withdrawal.user_id,
-        asset: withdrawal.asset,
-        field: 'available',
-        amount: withdrawal.amount, // Full amount including fee
-        entryType: 'withdrawal_failed',
-        idempotencyKey: `withdrawal_fail_refund:${withdrawal.id}`,
-        withdrawalId: withdrawal.id,
-        note: `Withdrawal broadcast failed: ${failureReason}`,
-      });
+    if (!updated) {
+      // Withdrawal was already confirmed, cancelled, or failed — skip refund
+      return;
+    }
+
+    // Refund the full debited amount (including fee) back to available
+    await mutateBalance(tx, {
+      userId: withdrawal.user_id,
+      asset: withdrawal.asset,
+      field: 'available',
+      amount: withdrawal.amount, // Full amount including fee
+      entryType: 'withdrawal_failed',
+      idempotencyKey: `withdrawal_refund:${withdrawal.id}`,
+      withdrawalId: withdrawal.id,
+      note: `Withdrawal broadcast failed: ${failureReason}`,
     });
-  } catch (err) {
-    console.error(`[Withdrawal Broadcaster] Failed to refund ${withdrawal.id}:`, err instanceof Error ? err.message : err);
-  }
+
+    // Notify user about the failed withdrawal
+    await tx.insert(notifications).values({
+      userId: withdrawal.user_id,
+      type: 'withdrawal_update',
+      title: 'Withdrawal Failed',
+      message: `Your withdrawal of ${withdrawal.amount} ${withdrawal.asset} has failed. Funds have been refunded.`,
+      metadata: {
+        withdrawalId: withdrawal.id,
+        asset: withdrawal.asset,
+        amount: withdrawal.amount,
+        chain: withdrawal.chain,
+      },
+    });
+  });
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

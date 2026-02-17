@@ -1,10 +1,12 @@
 import { db } from '../db/index.js';
-import { trades, users, disputes, complianceLogs } from '../db/schema.js';
-import { eq, and, lt, sql } from 'drizzle-orm';
+import { trades, users, disputes, complianceLogs, notifications, referralRewards } from '../db/schema.js';
+import { eq, and, lt, or, sql } from 'drizzle-orm';
+import { expireStaleRewards } from './referral.js';
 import { redis, KEYS } from './redis.js';
 import { env } from '../config/env.js';
 import { mutateBalance } from './balance.js';
 import { PLATFORM_USER_ID, isPlatformUser, completePlatformSellTrade } from './platform.js';
+import { logger } from '../config/logger.js';
 import Decimal from 'decimal.js';
 
 // ─── Valid State Transitions ────────────────────────────────────────────────
@@ -12,7 +14,7 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
   pending:            ['escrow_funded', 'expired', 'cancelled'],
   escrow_funded:      ['payment_sent', 'expired', 'cancelled'],
   payment_sent:       ['payment_confirmed', 'disputed', 'expired'],
-  payment_confirmed:  ['crypto_released', 'expired'],
+  payment_confirmed:  ['crypto_released', 'disputed', 'expired'],
   crypto_released:    ['completed'],
   disputed:           ['resolved_buyer', 'resolved_seller'],
 };
@@ -25,30 +27,58 @@ export async function transitionTrade(
   tradeId: string,
   newStatus: TradeStatus,
   actorId: string,
-): Promise<{ success: boolean; error?: string }> {
-  // Get current trade
-  const [trade] = await db
-    .select()
-    .from(trades)
-    .where(eq(trades.id, tradeId));
+  options?: { disputeData?: { openedBy: string; reason: string; evidenceUrls?: string[] } },
+): Promise<{ success: boolean; error?: string; disputeId?: string }> {
+  // Entire read + validation + mutation in one transaction with row lock
+  const txResult = await db.transaction(async (tx): Promise<
+    | { success: false; error: string; currentStatus?: undefined; trade?: undefined }
+    | { success: true; currentStatus: string; trade: Record<string, any>; disputeId?: string }
+  > => {
+    // Lock the trade row to prevent concurrent state transitions
+    const result = await tx.execute(
+      sql`SELECT * FROM trades WHERE id = ${tradeId} FOR UPDATE`,
+    ) as any;
+    const rows = Array.isArray(result) ? result : result?.rows ?? [];
+    if (rows.length === 0) return { success: false, error: 'Trade not found' };
 
-  if (!trade) return { success: false, error: 'Trade not found' };
+    // Map snake_case DB columns to camelCase
+    const row = rows[0] as any;
+    const trade = {
+      id: row.id,
+      orderId: row.order_id,
+      buyerId: row.buyer_id,
+      sellerId: row.seller_id,
+      cryptoAsset: row.crypto_asset,
+      amountCrypto: row.amount_crypto,
+      amountFiat: row.amount_fiat,
+      pricePerUnit: row.price_per_unit,
+      feePercent: row.fee_percent,
+      feeAmount: row.fee_amount,
+      status: row.status as string,
+      escrowFundedAt: row.escrow_funded_at,
+      paymentSentAt: row.payment_sent_at,
+      paymentConfirmedAt: row.payment_confirmed_at,
+      cryptoReleasedAt: row.crypto_released_at,
+      completedAt: row.completed_at,
+      expiresAt: row.expires_at,
+      holdingUntil: row.holding_until,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
 
-  // Validate actor permission
-  const actorPermission = validateActor(trade, newStatus, actorId);
-  if (!actorPermission.allowed) {
-    return { success: false, error: actorPermission.reason };
-  }
+    // Validate actor permission
+    const actorPermission = validateActor(trade as any, newStatus, actorId);
+    if (!actorPermission.allowed) {
+      return { success: false, error: actorPermission.reason ?? 'Permission denied' };
+    }
 
-  // Validate state transition
-  const currentStatus = trade.status;
-  const allowed = VALID_TRANSITIONS[currentStatus];
-  if (!allowed || !allowed.includes(newStatus)) {
-    return { success: false, error: `Cannot transition from ${currentStatus} to ${newStatus}` };
-  }
+    // Validate state transition
+    const currentStatus = trade.status;
+    const allowed = VALID_TRANSITIONS[currentStatus];
+    if (!allowed || !allowed.includes(newStatus)) {
+      return { success: false, error: `Cannot transition from ${currentStatus} to ${newStatus}` };
+    }
 
-  // Wrap state transition + balance mutations in a single transaction
-  await db.transaction(async (tx) => {
     const now = new Date();
     const updatePayload: Record<string, unknown> = {
       status: newStatus,
@@ -116,9 +146,9 @@ export async function transitionTrade(
       case 'completed': {
         updatePayload.completedAt = now;
 
-        // Fee: half charged to each side (stored as total in feeAmount)
-        const feePerSide = new Decimal(feeAmount).dividedBy(2);
-        const buyerReceives = new Decimal(amountCrypto).minus(feePerSide);
+        // Fee: total fee split across both sides, deducted from escrowed crypto
+        const totalFee = new Decimal(feeAmount);
+        const buyerReceives = new Decimal(amountCrypto).minus(totalFee);
 
         // Seller: debit locked (escrow release)
         await mutateBalance(tx, {
@@ -132,7 +162,7 @@ export async function transitionTrade(
           note: `Escrow released for completed trade ${tradeId}`,
         });
 
-        // Buyer: credit available (minus buyer-side fee)
+        // Buyer: credit available (minus total trading fee)
         await mutateBalance(tx, {
           userId: trade.buyerId,
           asset,
@@ -141,38 +171,34 @@ export async function transitionTrade(
           entryType: 'trade_credit',
           idempotencyKey: `trade:${tradeId}:credit:buyer`,
           tradeId,
-          note: `Received ${buyerReceives.toFixed(8)} ${asset} from trade ${tradeId} (fee: ${feePerSide.toFixed(8)})`,
+          note: `Received ${buyerReceives.toFixed(8)} ${asset} from trade ${tradeId} (fee: ${totalFee.toFixed(8)})`,
         });
 
-        // Platform: credit total fee (both halves)
-        const totalFee = new Decimal(feeAmount);
-        await tx.execute(
-          sql`UPDATE balances
-              SET available = available::numeric + ${totalFee.toFixed(18)}::numeric,
-                  updated_at = NOW()
-              WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${asset}`,
-        );
-        await tx.execute(
-          sql`INSERT INTO balance_ledger (user_id, asset, entry_type, amount, balance_field, balance_after, trade_id, idempotency_key, note)
-              VALUES (
-                ${PLATFORM_USER_ID}, ${asset}, 'fee_credit',
-                ${totalFee.toFixed(18)}, 'available',
-                (SELECT available FROM balances WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${asset}),
-                ${tradeId}, ${'trade:' + tradeId + ':fee_credit'},
-                ${'Trading fee from trade ' + tradeId}
-              )`,
-        );
+        // Platform: credit total fee
+        await mutateBalance(tx, {
+          userId: PLATFORM_USER_ID,
+          asset,
+          field: 'available',
+          amount: totalFee.toFixed(18),
+          entryType: 'fee_credit',
+          idempotencyKey: `trade:${tradeId}:fee_credit`,
+          tradeId,
+          note: `Trading fee from trade ${tradeId}`,
+        });
 
         // Update user stats
         await updateUserStats(tx, trade.buyerId, true);
         await updateUserStats(tx, trade.sellerId, true);
+
+        // Referral rewards are processed AFTER the transaction (see below)
+        // to prevent CAD balance issues from blocking trade completion.
         break;
       }
 
       case 'expired':
       case 'cancelled': {
-        // Return escrowed crypto to seller (only if escrow was funded)
-        if (currentStatus === 'escrow_funded' || currentStatus === 'payment_sent') {
+        // Return escrowed crypto to seller (only if escrow was funded at any prior stage)
+        if (currentStatus === 'escrow_funded' || currentStatus === 'payment_sent' || currentStatus === 'payment_confirmed') {
           // Seller: move crypto from locked → available
           await mutateBalance(tx, {
             userId: trade.sellerId,
@@ -200,8 +226,8 @@ export async function transitionTrade(
 
       case 'resolved_buyer': {
         // Dispute resolved in buyer's favor: release crypto to buyer
-        const rbFeePerSide = new Decimal(feeAmount).dividedBy(2);
-        const rbBuyerReceives = new Decimal(amountCrypto).minus(rbFeePerSide);
+        const rbTotalFee = new Decimal(feeAmount);
+        const rbBuyerReceives = new Decimal(amountCrypto).minus(rbTotalFee);
 
         await mutateBalance(tx, {
           userId: trade.sellerId,
@@ -225,23 +251,20 @@ export async function transitionTrade(
         });
 
         // Platform: credit total fee
-        const rbTotalFee = new Decimal(feeAmount);
-        await tx.execute(
-          sql`UPDATE balances
-              SET available = available::numeric + ${rbTotalFee.toFixed(18)}::numeric,
-                  updated_at = NOW()
-              WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${asset}`,
-        );
-        await tx.execute(
-          sql`INSERT INTO balance_ledger (user_id, asset, entry_type, amount, balance_field, balance_after, trade_id, idempotency_key, note)
-              VALUES (
-                ${PLATFORM_USER_ID}, ${asset}, 'fee_credit',
-                ${rbTotalFee.toFixed(18)}, 'available',
-                (SELECT available FROM balances WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${asset}),
-                ${tradeId}, ${'trade:' + tradeId + ':dispute_fee_credit'},
-                ${'Fee from dispute-resolved trade ' + tradeId}
-              )`,
-        );
+        await mutateBalance(tx, {
+          userId: PLATFORM_USER_ID,
+          asset,
+          field: 'available',
+          amount: rbTotalFee.toFixed(18),
+          entryType: 'fee_credit',
+          idempotencyKey: `trade:${tradeId}:dispute_fee_credit`,
+          tradeId,
+          note: `Fee from dispute-resolved trade ${tradeId}`,
+        });
+
+        // Buyer: trade fulfilled via dispute — count as completed trade
+        await updateUserStats(tx, trade.buyerId, true);
+        // Seller lost the dispute — do NOT credit their trade count
         break;
       }
 
@@ -278,7 +301,7 @@ export async function transitionTrade(
       .where(eq(trades.id, tradeId));
 
     // Log for compliance (FINTRAC) — large transactions
-    if (newStatus === 'completed' && Number(trade.amountFiat) >= 10000) {
+    if (newStatus === 'completed' && new Decimal(trade.amountFiat).gte(10000)) {
       await tx.insert(complianceLogs).values({
         userId: trade.buyerId,
         tradeId,
@@ -294,19 +317,251 @@ export async function transitionTrade(
         },
       });
     }
+
+    // Insert dispute record atomically within the same transaction
+    let disputeId: string | undefined;
+    if (newStatus === 'disputed' && options?.disputeData) {
+      const [dispute] = await tx
+        .insert(disputes)
+        .values({
+          tradeId,
+          openedBy: options.disputeData.openedBy,
+          reason: options.disputeData.reason,
+          evidenceUrls: options.disputeData.evidenceUrls ?? [],
+        })
+        .returning({ id: disputes.id });
+      disputeId = dispute.id;
+
+      // File STR for compliance (FINTRAC)
+      await tx.insert(complianceLogs).values({
+        userId: options.disputeData.openedBy,
+        tradeId,
+        eventType: 'str',
+        payload: {
+          type: 'suspicious_transaction_report',
+          reason: 'Trade disputed by participant',
+          disputeReason: options.disputeData.reason,
+          tradeId,
+        },
+      });
+    }
+
+    // Return trade data for post-transaction notifications
+    return { success: true as const, currentStatus, trade, disputeId };
   });
 
+  // Transaction failed — return validation error
+  if (!txResult.success) return txResult as { success: false; error: string };
+
+  const currentStatus = txResult.currentStatus!;
+  const trade = txResult.trade!;
+
   // Publish event (outside transaction — Redis pub/sub)
+  // MUST include buyerId/sellerId for WebSocket routing to trade participants
   await redis.publish(KEYS.tradeChannel, JSON.stringify({
     type: 'trade_status_changed',
     tradeId,
+    buyerId: trade.buyerId,
+    sellerId: trade.sellerId,
     oldStatus: currentStatus,
     newStatus,
-    actorId,
     timestamp: new Date().toISOString(),
   }));
 
-  return { success: true };
+  logger.info({ tradeId, fromStatus: currentStatus, toStatus: newStatus, actorId }, 'trade state transition');
+
+  // ─── Notifications per Status Transition ──────────────────────────────────
+  try {
+    const tradeNotifications: Array<{
+      userId: string;
+      type: string;
+      title: string;
+      message: string;
+      metadata: Record<string, unknown>;
+    }> = [];
+
+    const meta = { tradeId };
+
+    switch (newStatus) {
+      case 'payment_sent':
+        tradeNotifications.push({
+          userId: trade.sellerId,
+          type: 'trade_update',
+          title: 'Payment Sent',
+          message: `Buyer has sent payment for trade #${tradeId.slice(0, 8)}`,
+          metadata: meta,
+        });
+        break;
+
+      case 'payment_confirmed':
+        tradeNotifications.push({
+          userId: trade.buyerId,
+          type: 'trade_update',
+          title: 'Payment Confirmed',
+          message: `Payment confirmed for trade #${tradeId.slice(0, 8)}`,
+          metadata: meta,
+        });
+        break;
+
+      case 'completed':
+        tradeNotifications.push(
+          {
+            userId: trade.buyerId,
+            type: 'trade_update',
+            title: 'Trade Completed',
+            message: `Trade #${tradeId.slice(0, 8)} completed successfully`,
+            metadata: meta,
+          },
+          {
+            userId: trade.sellerId,
+            type: 'trade_update',
+            title: 'Trade Completed',
+            message: `Trade #${tradeId.slice(0, 8)} completed successfully`,
+            metadata: meta,
+          },
+        );
+        break;
+
+      case 'cancelled':
+        tradeNotifications.push(
+          {
+            userId: trade.buyerId,
+            type: 'trade_update',
+            title: 'Trade Cancelled',
+            message: `Trade #${tradeId.slice(0, 8)} has been cancelled`,
+            metadata: meta,
+          },
+          {
+            userId: trade.sellerId,
+            type: 'trade_update',
+            title: 'Trade Cancelled',
+            message: `Trade #${tradeId.slice(0, 8)} has been cancelled`,
+            metadata: meta,
+          },
+        );
+        break;
+
+      case 'disputed':
+        tradeNotifications.push(
+          {
+            userId: trade.buyerId,
+            type: 'trade_update',
+            title: 'Dispute Opened',
+            message: `A dispute has been opened for trade #${tradeId.slice(0, 8)}`,
+            metadata: meta,
+          },
+          {
+            userId: trade.sellerId,
+            type: 'trade_update',
+            title: 'Dispute Opened',
+            message: `A dispute has been opened for trade #${tradeId.slice(0, 8)}`,
+            metadata: meta,
+          },
+        );
+        break;
+
+      case 'resolved_buyer':
+        tradeNotifications.push(
+          {
+            userId: trade.buyerId,
+            type: 'trade_update',
+            title: 'Dispute Resolved',
+            message: `Dispute resolved in your favor. Crypto has been released to your wallet.`,
+            metadata: meta,
+          },
+          {
+            userId: trade.sellerId,
+            type: 'trade_update',
+            title: 'Dispute Resolved',
+            message: `Dispute for trade #${tradeId.slice(0, 8)} has been resolved in the buyer's favor.`,
+            metadata: meta,
+          },
+        );
+        break;
+
+      case 'resolved_seller':
+        tradeNotifications.push(
+          {
+            userId: trade.sellerId,
+            type: 'trade_update',
+            title: 'Dispute Resolved',
+            message: `Dispute resolved in your favor. Escrowed crypto has been returned to your wallet.`,
+            metadata: meta,
+          },
+          {
+            userId: trade.buyerId,
+            type: 'trade_update',
+            title: 'Dispute Resolved',
+            message: `Dispute for trade #${tradeId.slice(0, 8)} has been resolved in the seller's favor.`,
+            metadata: meta,
+          },
+        );
+        break;
+    }
+
+    if (tradeNotifications.length > 0) {
+      await db.insert(notifications).values(tradeNotifications);
+    }
+  } catch (err) {
+    // Non-critical — don't fail the trade transition for a notification error
+    logger.error({ tradeId, newStatus, err }, 'failed to create trade notification');
+  }
+
+  // ─── Referral Rewards (outside main transaction — non-critical) ───────────
+  if (newStatus === 'completed') {
+    try {
+      // Opportunistically expire stale rewards (> 90 days)
+      await expireStaleRewards();
+
+      const pendingRewards = await db.select().from(referralRewards)
+        .where(and(
+          or(
+            eq(referralRewards.refereeId, trade.buyerId),
+            eq(referralRewards.refereeId, trade.sellerId),
+          ),
+          eq(referralRewards.status, 'pending'),
+        ));
+      for (const reward of pendingRewards) {
+        const rewardAmountStr = new Decimal(reward.rewardAmount).toFixed(2);
+
+        // Mark as credited
+        await db.update(referralRewards)
+          .set({ status: 'credited', creditedAt: new Date() })
+          .where(eq(referralRewards.id, reward.id));
+
+        // Credit fee_credit_cad to BOTH referrer and referee (atomic SQL increment)
+        await db.update(users)
+          .set({ feeCreditCad: sql`${users.feeCreditCad} + ${reward.rewardAmount}` })
+          .where(eq(users.id, reward.referrerId));
+        await db.update(users)
+          .set({ feeCreditCad: sql`${users.feeCreditCad} + ${reward.rewardAmount}` })
+          .where(eq(users.id, reward.refereeId));
+
+        // Notify both parties
+        await db.insert(notifications).values([
+          {
+            userId: reward.referrerId,
+            type: 'system',
+            title: 'Referral Reward Earned!',
+            message: `You earned a $${rewardAmountStr} CAD fee credit from your referral! It will be applied to your next trade.`,
+            metadata: { referralRewardId: reward.id },
+          },
+          {
+            userId: reward.refereeId,
+            type: 'system',
+            title: 'Welcome Bonus Earned!',
+            message: `You earned a $${rewardAmountStr} CAD fee credit as a welcome bonus! It will be applied to your next trade.`,
+            metadata: { referralRewardId: reward.id },
+          },
+        ]);
+      }
+    } catch (err) {
+      // Non-critical — trade already completed, referral credit can be retried
+      logger.error({ tradeId, err }, 'failed to process referral rewards');
+    }
+  }
+
+  return { success: true, disputeId: txResult.disputeId };
 }
 
 // ─── Open Dispute ───────────────────────────────────────────────────────────
@@ -317,35 +572,10 @@ export async function openDispute(
   reason: string,
   evidenceUrls: string[] = [],
 ): Promise<{ success: boolean; disputeId?: string; error?: string }> {
-  // Transition trade to disputed state
-  const result = await transitionTrade(tradeId, 'disputed', userId);
-  if (!result.success) return result;
-
-  // Create dispute record
-  const [dispute] = await db
-    .insert(disputes)
-    .values({
-      tradeId,
-      openedBy: userId,
-      reason,
-      evidenceUrls,
-    })
-    .returning({ id: disputes.id });
-
-  // File STR if suspicious
-  await db.insert(complianceLogs).values({
-    userId,
-    tradeId,
-    eventType: 'str',
-    payload: {
-      type: 'suspicious_transaction_report',
-      reason: 'Trade disputed by participant',
-      disputeReason: reason,
-      tradeId,
-    },
+  // Dispute record + STR are created atomically inside the transitionTrade transaction
+  return transitionTrade(tradeId, 'disputed', userId, {
+    disputeData: { openedBy: userId, reason, evidenceUrls },
   });
-
-  return { success: true, disputeId: dispute.id };
 }
 
 // ─── Timeout Processing ─────────────────────────────────────────────────────
@@ -375,24 +605,29 @@ export async function processExpiredTrades(): Promise<number> {
       processed++;
     } else if (trade.status === 'payment_sent') {
       // Seller didn't confirm payment → auto-dispute
-      await transitionTrade(trade.id, 'disputed', 'system');
-      await db.insert(disputes).values({
-        tradeId: trade.id,
-        openedBy: trade.buyerId,
-        reason: 'Seller did not confirm payment within the time window. Auto-dispute triggered.',
+      // Dispute record is created atomically inside transitionTrade
+      await transitionTrade(trade.id, 'disputed', 'system', {
+        disputeData: {
+          openedBy: trade.buyerId,
+          reason: 'Seller did not confirm payment within the time window. Auto-dispute triggered.',
+        },
       });
       processed++;
     }
   }
 
-  // Process trades past holding period
+  // Process trades past holding period (includes safety net for null holdingUntil:
+  // if holdingUntil is NULL, treat as immediately releasable to prevent stuck funds)
   const holdingComplete = await db
     .select()
     .from(trades)
     .where(
       and(
         eq(trades.status, 'payment_confirmed'),
-        lt(trades.holdingUntil, now),
+        or(
+          lt(trades.holdingUntil, now),
+          sql`${trades.holdingUntil} IS NULL`,
+        ),
       )
     );
 
@@ -407,6 +642,21 @@ export async function processExpiredTrades(): Promise<number> {
       await transitionTrade(trade.id, 'completed', 'system');
     }
     processed++;
+  }
+
+  // Recovery: advance any trades stuck at crypto_released (e.g., if a previous
+  // completed transition failed after crypto_released succeeded)
+  const stuckReleased = await db
+    .select()
+    .from(trades)
+    .where(eq(trades.status, 'crypto_released'));
+
+  for (const trade of stuckReleased) {
+    const result = await transitionTrade(trade.id, 'completed', 'system');
+    if (result.success) {
+      logger.info({ tradeId: trade.id }, 'Recovered stuck crypto_released trade → completed');
+      processed++;
+    }
   }
 
   return processed;
@@ -489,7 +739,7 @@ async function updateUserStats(tx: any, userId: string, completedSuccessfully: b
       else if (user.tradeCount >= 5) newLimit = 1000;
       else if (user.tradeCount >= 3) newLimit = 500;
 
-      if (Number(user.maxTradeLimit) < newLimit) {
+      if (new Decimal(user.maxTradeLimit).lt(newLimit)) {
         await tx
           .update(users)
           .set({ maxTradeLimit: String(newLimit), updatedAt: new Date() })

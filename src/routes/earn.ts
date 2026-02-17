@@ -30,7 +30,9 @@ export async function earnRoutes(app: FastifyInstance) {
   // ─── Get Staking Products ────────────────────────────────────────────
   app.get('/api/earn/products', { preHandler: [authGuard] }, async (request) => {
     const query = request.query as { term?: string };
-    const products = await getStakingProducts(query.term);
+    const validTerms = ['flexible', 'short', 'medium', 'long'];
+    const term = query.term && validTerms.includes(query.term) ? query.term : undefined;
+    const products = await getStakingProducts(term);
     return { products };
   });
 
@@ -46,7 +48,10 @@ export async function earnRoutes(app: FastifyInstance) {
   });
 
   // ─── Stake Asset ─────────────────────────────────────────────────────
-  app.post('/api/earn/stake', { preHandler: [authGuard] }, async (request, reply) => {
+  app.post('/api/earn/stake', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: [authGuard],
+  }, async (request, reply) => {
     const body = stakeSchema.parse(request.body);
     const result = await stakeAsset(request.userId, body.productId, body.allocationPercent);
 
@@ -61,7 +66,10 @@ export async function earnRoutes(app: FastifyInstance) {
   });
 
   // ─── Bulk Stake (from Optimize screen) ───────────────────────────────
-  app.post('/api/earn/stake/bulk', { preHandler: [authGuard] }, async (request, reply) => {
+  app.post('/api/earn/stake/bulk', {
+    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+    preHandler: [authGuard],
+  }, async (request, reply) => {
     const body = bulkStakeSchema.parse(request.body);
     const results = [];
 
@@ -83,7 +91,10 @@ export async function earnRoutes(app: FastifyInstance) {
   });
 
   // ─── Unstake ─────────────────────────────────────────────────────────
-  app.post('/api/earn/unstake', { preHandler: [authGuard] }, async (request, reply) => {
+  app.post('/api/earn/unstake', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: [authGuard],
+  }, async (request, reply) => {
     const body = unstakeSchema.parse(request.body);
     const result = await unstakeAsset(request.userId, body.positionId);
 

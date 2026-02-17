@@ -1,3 +1,4 @@
+import { logger } from '../config/logger.js';
 import axios from 'axios';
 import { redis, KEYS } from './redis.js';
 import { env } from '../config/env.js';
@@ -19,10 +20,20 @@ interface PriceData {
   cadPrice: number;
   usdPrice: number;
   change24h: number;
+  high24h?: number;
+  low24h?: number;
+  volume24h?: number;
   lastUpdated: string;
 }
 
 let priceCache: Map<string, PriceData> = new Map();
+let lastSuccessfulFetch: Date | null = null;
+const MAX_STALENESS_MS = 5 * 60 * 1000; // 5 minutes
+
+export function getPriceAge(): number {
+  if (!lastSuccessfulFetch) return Infinity;
+  return Date.now() - lastSuccessfulFetch.getTime();
+}
 
 export async function fetchPrices(): Promise<PriceData[]> {
   try {
@@ -66,9 +77,14 @@ export async function fetchPrices(): Promise<PriceData[]> {
       );
     }
 
+    lastSuccessfulFetch = new Date();
     return prices;
   } catch (err) {
-    console.error('Price fetch failed:', err instanceof Error ? err.message : err);
+    logger.error({ err }, 'Price fetch failed');
+    const staleness = getPriceAge();
+    if (staleness > MAX_STALENESS_MS) {
+      logger.warn({ stalenessMs: staleness }, 'Serving stale prices — last successful fetch was over 5 minutes ago');
+    }
     // Return cached prices on failure
     return Array.from(priceCache.values());
   }
@@ -142,6 +158,15 @@ export async function getAllPricesCached(): Promise<PriceData[]> {
 export function startPriceFeed(intervalMs = 30_000): NodeJS.Timeout {
   // Fetch immediately on start
   fetchPrices();
-  // Then every 30 seconds
+  // Then at the configured interval
   return setInterval(fetchPrices, intervalMs);
+}
+
+/**
+ * Get cached 1-minute candles for a symbol (populated by MEXC feed).
+ */
+export async function getCandles(symbol: string, interval = '1m'): Promise<Array<{ timestamp: string; usdPrice: number; cadPrice: number }> | null> {
+  const cached = await redis.get(KEYS.candles(symbol, interval));
+  if (!cached) return null;
+  return JSON.parse(cached);
 }

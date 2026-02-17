@@ -1,6 +1,7 @@
+import { logger } from '../config/logger.js';
 import { db } from '../db/index.js';
 import { orders, trades } from '../db/schema.js';
-import { eq, and, ne, sql } from 'drizzle-orm';
+import { eq, and, ne, gt, sql } from 'drizzle-orm';
 import { redis, KEYS } from './redis.js';
 import { getPrice } from './price.js';
 import { env } from '../config/env.js';
@@ -43,8 +44,12 @@ export interface TradeMatch {
 export async function matchOrder(incoming: MatchableOrder): Promise<TradeMatch[]> {
   const oppositeType = incoming.type === 'buy' ? 'sell' : 'buy';
 
-  // Asset-specific advisory lock to prevent concurrent double-matching
-  const assetLockId = Buffer.from(incoming.cryptoAsset).reduce((acc, b) => acc + b, 0);
+  // Asset-specific advisory lock to prevent concurrent double-matching.
+  // Use polynomial hash (FNV-1a inspired) to avoid collisions from simple byte-sum.
+  const assetLockId = Buffer.from(incoming.cryptoAsset).reduce(
+    (hash, b) => ((hash ^ b) * 16777619) | 0, // FNV prime, keep as 32-bit int
+    2166136261, // FNV offset basis
+  );
   await db.execute(sql`SELECT pg_advisory_lock(${assetLockId})`);
 
   try {
@@ -65,6 +70,7 @@ async function matchOrderInner(incoming: MatchableOrder, oppositeType: string): 
         eq(orders.type, oppositeType),
         eq(orders.cryptoAsset, incoming.cryptoAsset),
         ne(orders.userId, incoming.userId), // can't self-trade
+        gt(orders.createdAt, new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)), // exclude stale orders (>90 days)
       )
     );
 
@@ -118,16 +124,20 @@ async function matchOrderInner(incoming: MatchableOrder, oppositeType: string): 
     if (fillFiat < candidate.minTrade || fillFiat < incoming.minTrade) continue;
 
     // Add random cents for e-Transfer disambiguation (0.01 - 0.99)
+    // Clamp to not exceed either party's maxTrade or remaining amounts
     const randomCents = Math.floor(Math.random() * 99 + 1) / 100;
-    const disambiguatedFiat = new Decimal(fillFiat).plus(randomCents).toDecimalPlaces(2).toNumber();
+    const maxAllowed = Math.min(candidate.maxTrade, incoming.maxTrade, candidate.remainingFiat, remaining);
+    const rawDisambiguated = new Decimal(fillFiat).plus(randomCents).toDecimalPlaces(2);
+    const disambiguatedFiat = Decimal.min(rawDisambiguated, new Decimal(maxAllowed)).toNumber();
 
     // Calculate crypto amount at the trade price
     const amountCrypto = new Decimal(disambiguatedFiat).dividedBy(candidate.effectivePrice);
 
     // Fee charged on crypto — 0.2% to EACH side (buyer + seller)
+    // Round UP to ensure platform never loses fractional satoshis
     const feePercent = env.TAKER_FEE_PERCENT; // 0.2% per side
-    const feePerSide = amountCrypto.times(feePercent).dividedBy(100);
-    const totalFee = feePerSide.times(2); // total platform revenue per trade
+    const feePerSide = amountCrypto.times(feePercent).dividedBy(100).toDecimalPlaces(8, Decimal.ROUND_UP);
+    const totalFee = feePerSide.times(2).toDecimalPlaces(8, Decimal.ROUND_UP); // total platform revenue per trade
 
     matches.push({
       orderId: candidate.id,
@@ -168,6 +178,13 @@ export async function executeMatches(
     try {
       const tradeId = await db.transaction(async (tx) => {
         const now = new Date();
+
+        // 0. Lock the matched order and verify it's still active (prevents race with cancel)
+        await tx.execute(sql`SELECT id FROM orders WHERE id = ${match.orderId} FOR UPDATE`);
+        const [matchedOrder] = await tx.select({ status: orders.status }).from(orders).where(eq(orders.id, match.orderId));
+        if (!matchedOrder || matchedOrder.status !== 'active') {
+          return null; // Order was cancelled/paused between match and execution
+        }
 
         // 1. Create trade record at escrow_funded (auto-escrow on match)
         const [trade] = await tx
@@ -229,8 +246,25 @@ export async function executeMatches(
             sql`${orders.remainingFiat} <= 0`,
           ));
 
+        // Auto-cancel dust: remaining > 0 but below minTrade — unmatchable zombie
+        await tx
+          .update(orders)
+          .set({ status: 'cancelled', updatedAt: now })
+          .where(and(
+            eq(orders.id, match.orderId),
+            eq(orders.status, 'active'),
+            sql`${orders.remainingFiat} > 0`,
+            sql`${orders.remainingFiat} < ${orders.minTrade}`,
+          ));
+
         return trade.id;
       });
+
+      // Transaction returns null if the candidate order was cancelled/paused
+      if (!tradeId) {
+        logger.info({ orderId: match.orderId }, 'Match skipped — order no longer active');
+        continue;
+      }
 
       tradeIds.push(tradeId);
       totalFilledFiat = new Decimal(totalFilledFiat).plus(match.amountFiat).toNumber();
@@ -247,8 +281,9 @@ export async function executeMatches(
     } catch (err: any) {
       // Seller likely doesn't have enough balance (multiple orders exhausted it).
       // Skip this match — the order stays on the book for future matching.
-      console.warn(
-        `Match skipped (order ${match.orderId}): ${err.message ?? err}`,
+      logger.warn(
+        { orderId: match.orderId, err: err.message ?? String(err) },
+        'Match skipped due to insufficient balance',
       );
       continue;
     }
@@ -273,6 +308,17 @@ export async function executeMatches(
         sql`${orders.remainingFiat} <= 0`,
       ));
 
+    // Auto-cancel incoming if dust remaining (below minTrade — can never match again)
+    await db
+      .update(orders)
+      .set({ status: 'cancelled', updatedAt: new Date() })
+      .where(and(
+        eq(orders.id, incomingOrderId),
+        eq(orders.status, 'active'),
+        sql`${orders.remainingFiat} > 0`,
+        sql`${orders.remainingFiat} < ${orders.minTrade}`,
+      ));
+
     // Publish order book update
     await redis.publish(KEYS.orderBookChannel(cryptoAsset), JSON.stringify({
       type: 'orderbook_update',
@@ -281,6 +327,74 @@ export async function executeMatches(
   }
 
   return tradeIds;
+}
+
+// ─── Background Re-Matching ─────────────────────────────────────────────────
+
+/**
+ * Re-attempt matching for active orders that have unfilled remaining amounts.
+ * Run periodically (every 60s) alongside processExpiredTrades.
+ *
+ * Catches cases where a new sell order arrives after a buy was only partially
+ * filled, or vice versa.
+ */
+export async function rematchActiveOrders(): Promise<number> {
+  // Find orders that are still active with remaining amounts
+  const activeOrders = await db
+    .select()
+    .from(orders)
+    .where(
+      and(
+        eq(orders.status, 'active'),
+        gt(orders.remainingFiat, sql`0`),
+        gt(orders.createdAt, new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)),
+      ),
+    );
+
+  let matched = 0;
+
+  for (const order of activeOrders) {
+    const effectivePrice = await resolvePrice(
+      order.cryptoAsset,
+      order.priceType,
+      order.pricePremium,
+      order.fixedPrice,
+    );
+    if (!effectivePrice) continue;
+
+    const matchable: MatchableOrder = {
+      id: order.id,
+      userId: order.userId,
+      type: order.type as 'buy' | 'sell',
+      cryptoAsset: order.cryptoAsset,
+      effectivePrice,
+      remainingFiat: Number(order.remainingFiat),
+      minTrade: Number(order.minTrade),
+      maxTrade: Number(order.maxTrade),
+      createdAt: order.createdAt,
+    };
+
+    const matches = await matchOrder(matchable);
+    if (matches.length > 0) {
+      const tradeIds = await executeMatches(order.id, matches, order.cryptoAsset);
+      if (tradeIds.length > 0) {
+        matched += tradeIds.length;
+
+        // Notify the order owner of new fills via Redis
+        await redis.publish(KEYS.tradeChannel, JSON.stringify({
+          type: 'order_partially_filled',
+          orderId: order.id,
+          newTradeIds: tradeIds,
+          userId: order.userId,
+        }));
+      }
+    }
+  }
+
+  if (matched > 0) {
+    logger.info({ matchedTrades: matched }, 'Background re-matching found new fills');
+  }
+  return matched;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { logger } from './logger.js';
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
@@ -14,7 +15,7 @@ const envSchema = z.object({
   // JWT
   JWT_SECRET: z.string().default('maple-dev-secret-change-in-production'),
   JWT_ACCESS_EXPIRY: z.string().default('15m'),
-  JWT_REFRESH_EXPIRY: z.string().default('7d'),
+  JWT_REFRESH_EXPIRY: z.string().default('90d'),
 
   // Trading
   TAKER_FEE_PERCENT: z.coerce.number().default(0.2),
@@ -45,6 +46,10 @@ const envSchema = z.object({
 
   // ─── Withdrawal ────────────────────────────────────────────────────────
   WITHDRAWAL_AUTO_APPROVE_CAD_LIMIT: z.coerce.number().default(500),
+  WITHDRAWAL_DAILY_LIMIT_CAD: z.coerce.number().default(10_000),
+  WITHDRAWAL_MONTHLY_LIMIT_CAD: z.coerce.number().default(50_000),
+  WITHDRAWAL_COOLDOWN_MINUTES: z.coerce.number().default(5),
+  ADDRESS_COOLDOWN_HOURS: z.coerce.number().default(24),
 
   // ─── Deposit Monitoring ────────────────────────────────────────────────
   DEPOSIT_SCAN_INTERVAL_MS: z.coerce.number().default(30000),
@@ -69,6 +74,15 @@ const envSchema = z.object({
 
   // ─── Admin ────────────────────────────────────────────────────────────
   ADMIN_USER_IDS: z.string().default(''),
+
+  // ─── App Config (Version Check & Maintenance) ───────────────────────
+  APP_MIN_VERSION: z.string().default('1.0.0'),
+  APP_LATEST_VERSION: z.string().default('1.0.0'),
+  MAINTENANCE_MODE: z.coerce.boolean().default(false),
+  MAINTENANCE_MESSAGE: z.string().optional(),
+
+  // ─── CORS ────────────────────────────────────────────────────────────
+  CORS_ORIGINS: z.string().default('https://mapleexchange.ca,https://maplecx.app,https://maple-exchange-api.onrender.com'),
 });
 
 export type Env = z.infer<typeof envSchema>;
@@ -93,5 +107,9 @@ if (env.NODE_ENV === 'production') {
 
   if (env.JWT_SECRET === 'maple-dev-secret-change-in-production') {
     throw new Error('FATAL: JWT_SECRET is using the default dev secret. Set a real secret in production.');
+  }
+
+  if (!env.ADMIN_USER_IDS || env.ADMIN_USER_IDS.trim() === '') {
+    logger.warn('ADMIN_USER_IDS is empty — admin endpoints will be inaccessible');
   }
 }

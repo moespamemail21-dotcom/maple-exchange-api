@@ -2,6 +2,7 @@ import { db } from '../db/index.js';
 import { notifications } from '../db/schema.js';
 import { eq, count } from 'drizzle-orm';
 import { PLATFORM_USER_ID } from './platform.js';
+import { logger } from '../config/logger.js';
 
 /**
  * Seed sample notifications for the platform user.
@@ -93,5 +94,5 @@ export async function seedNotifications(): Promise<void> {
   ];
 
   await db.insert(notifications).values(samples);
-  console.log(`  Seeded ${samples.length} sample notifications`);
+  logger.info({ count: samples.length }, 'Seeded sample notifications');
 }

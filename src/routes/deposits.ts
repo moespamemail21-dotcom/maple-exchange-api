@@ -1,8 +1,11 @@
 import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
 import { db } from '../db/index.js';
 import { deposits } from '../db/schema.js';
-import { eq, and, desc } from 'drizzle-orm';
+import { eq, and, desc, count } from 'drizzle-orm';
 import { authGuard } from '../middleware/auth.js';
+
+const uuidParamSchema = z.object({ id: z.string().uuid() });
 
 export async function depositRoutes(app: FastifyInstance) {
   // ─── List Deposits ──────────────────────────────────────────────────
@@ -13,7 +16,7 @@ export async function depositRoutes(app: FastifyInstance) {
     if (query.status) conditions.push(eq(deposits.status, query.status));
 
     const limit = Math.min(Number(query.limit) || 50, 200);
-    const offset = Number(query.offset) || 0;
+    const offset = Math.min(Math.max(Number(query.offset) || 0, 0), 10_000);
 
     const rows = await db
       .select({
@@ -36,12 +39,17 @@ export async function depositRoutes(app: FastifyInstance) {
       .limit(limit)
       .offset(offset);
 
-    return { deposits: rows };
+    const [{ total }] = await db
+      .select({ total: count() })
+      .from(deposits)
+      .where(and(...conditions));
+
+    return { deposits: rows, total, limit, offset };
   });
 
   // ─── Get Single Deposit ─────────────────────────────────────────────
   app.get('/api/deposits/:id', { preHandler: [authGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
+    const { id } = uuidParamSchema.parse(request.params);
 
     const [deposit] = await db
       .select()

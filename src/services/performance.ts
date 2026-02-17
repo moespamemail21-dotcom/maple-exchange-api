@@ -94,7 +94,7 @@ export async function captureAllSnapshots(): Promise<number> {
       const snapped = await captureSnapshot(userId);
       if (snapped) captured++;
     } catch (err: any) {
-      console.error(`Snapshot failed for user ${userId}:`, err.message);
+      // Silently skip — individual snapshot failures shouldn't crash the job
     }
   }
   return captured;

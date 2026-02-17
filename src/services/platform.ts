@@ -1,11 +1,56 @@
 import { db } from '../db/index.js';
 import { users, trades, balances } from '../db/schema.js';
-import { eq, and, sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { env } from '../config/env.js';
 import { mutateBalance } from './balance.js';
 import { redis, KEYS } from './redis.js';
 import Decimal from 'decimal.js';
 import { SUPPORTED_ASSETS } from './balance.js';
+import { logger } from '../config/logger.js';
+
+// ─── Fee Credit Helper ──────────────────────────────────────────────────────
+//
+// Applies user's CAD fee credits to reduce trading fees.
+// Must be called INSIDE a transaction to prevent TOCTOU races.
+//
+
+async function applyFeeCredit(
+  tx: any,
+  userId: string,
+  feeAmountCrypto: Decimal,
+  pricePerUnit: number,
+): Promise<{ adjustedFee: Decimal; creditUsedCad: Decimal }> {
+  // Look up user's fee credit balance inside the transaction
+  const [user] = await tx.select({ feeCreditCad: users.feeCreditCad }).from(users)
+    .where(eq(users.id, userId));
+
+  if (!user || new Decimal(user.feeCreditCad).isZero()) {
+    return { adjustedFee: feeAmountCrypto, creditUsedCad: new Decimal(0) };
+  }
+
+  const availableCredit = new Decimal(user.feeCreditCad);
+  const feeAmountCad = feeAmountCrypto.times(pricePerUnit).toDecimalPlaces(2, Decimal.ROUND_UP);
+
+  // Use up to the full fee amount in credits
+  const creditToUse = Decimal.min(availableCredit, feeAmountCad);
+
+  if (creditToUse.isZero()) {
+    return { adjustedFee: feeAmountCrypto, creditUsedCad: new Decimal(0) };
+  }
+
+  // Convert credit back to crypto reduction
+  const feeReduction = creditToUse.dividedBy(pricePerUnit).toDecimalPlaces(8, Decimal.ROUND_DOWN);
+  const adjustedFee = Decimal.max(feeAmountCrypto.minus(feeReduction), new Decimal(0));
+
+  // Deduct from user's fee credit (atomic SQL decrement)
+  await tx.update(users)
+    .set({ feeCreditCad: sql`${users.feeCreditCad} - ${creditToUse.toFixed(2)}` })
+    .where(eq(users.id, userId));
+
+  logger.info({ userId, creditUsedCad: creditToUse.toFixed(2), feeReduction: feeReduction.toFixed(8) }, 'Applied fee credit');
+
+  return { adjustedFee, creditUsedCad: creditToUse };
+}
 
 // ─── Platform System User ──────────────────────────────────────────────────
 //
@@ -60,7 +105,7 @@ export async function ensurePlatformUser(): Promise<void> {
     await tx.insert(balances).values(rows);
   });
 
-  console.log('  Platform market maker user created');
+  logger.info('Platform market maker user created');
 }
 
 /**
@@ -82,22 +127,17 @@ async function creditPlatformFee(
   const totalFee = new Decimal(feeAmount);
   if (totalFee.isZero()) return;
 
-  await tx.execute(
-    sql`UPDATE balances
-        SET available = available::numeric + ${totalFee.toFixed(18)}::numeric,
-            updated_at = NOW()
-        WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${asset}`,
-  );
-  await tx.execute(
-    sql`INSERT INTO balance_ledger (user_id, asset, entry_type, amount, balance_field, balance_after, trade_id, idempotency_key, note)
-        VALUES (
-          ${PLATFORM_USER_ID}, ${asset}, 'fee_credit',
-          ${totalFee.toFixed(18)}, 'available',
-          (SELECT available FROM balances WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${asset}),
-          ${tradeId}, ${'trade:' + tradeId + ':' + idempotencySuffix},
-          ${'Trading fee from trade ' + tradeId}
-        )`,
-  );
+  await mutateBalance(tx, {
+    userId: PLATFORM_USER_ID,
+    asset,
+    field: 'available',
+    amount: totalFee.toFixed(18),
+    entryType: 'fee_credit',
+    idempotencyKey: `trade:${tradeId}:${idempotencySuffix}`,
+    tradeId,
+    note: `Trading fee from trade ${tradeId}`,
+    allowNegative: true,
+  });
 }
 
 // ─── Helper: Graduate user trade limit ───────────────────────────────────────
@@ -120,7 +160,7 @@ async function graduateUserLimit(tx: any, userId: string) {
     else if (user.tradeCount >= 5) newLimit = 1000;
     else if (user.tradeCount >= 3) newLimit = 500;
 
-    if (Number(user.maxTradeLimit) < newLimit) {
+    if (new Decimal(user.maxTradeLimit).lessThan(newLimit)) {
       await tx
         .update(users)
         .set({ maxTradeLimit: String(newLimit), updatedAt: now })
@@ -146,16 +186,20 @@ export async function createPlatformFill(
 ): Promise<string | null> {
   const amountCrypto = new Decimal(amountFiat).dividedBy(pricePerUnit);
   const feePercent = env.TAKER_FEE_PERCENT;
-  const feePerSide = amountCrypto.times(feePercent).dividedBy(100);
-  const totalFee = feePerSide.times(2);
+  const feePerSide = amountCrypto.times(feePercent).dividedBy(100).toDecimalPlaces(8, Decimal.ROUND_UP);
+  const baseTotalFee = feePerSide.times(2).toDecimalPlaces(8, Decimal.ROUND_UP);
 
-  // Add random cents for e-Transfer disambiguation
+  // Add random cents for e-Transfer disambiguation (capped to not exceed original order)
   const randomCents = Math.floor(Math.random() * 99 + 1) / 100;
-  const disambiguatedFiat = Math.round((amountFiat + randomCents) * 100) / 100;
+  const rawDisambiguated = new Decimal(amountFiat).plus(randomCents).toDecimalPlaces(2);
+  const disambiguatedFiat = Decimal.min(rawDisambiguated, new Decimal(amountFiat).plus(0.99)).toNumber();
 
   try {
     const tradeId = await db.transaction(async (tx) => {
       const now = new Date();
+
+      // Apply fee credits (buyer pays the fee on buy orders)
+      const { adjustedFee: totalFee } = await applyFeeCredit(tx, buyerId, baseTotalFee, pricePerUnit);
 
       // Create trade — platform is the seller, already at escrow_funded
       const [trade] = await tx
@@ -176,39 +220,45 @@ export async function createPlatformFill(
         })
         .returning({ id: trades.id });
 
-      // Platform seller: lock balance (allowed to go negative for platform)
-      await tx.execute(
-        sql`UPDATE balances
-            SET locked = locked::numeric + ${amountCrypto.toFixed(18)}::numeric,
-                updated_at = NOW()
-            WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${cryptoAsset}`,
-      );
-
-      // Ledger entry for platform escrow lock
-      await tx.execute(
-        sql`INSERT INTO balance_ledger (user_id, asset, entry_type, amount, balance_field, balance_after, trade_id, idempotency_key, note)
-            VALUES (
-              ${PLATFORM_USER_ID}, ${cryptoAsset}, 'trade_escrow_lock',
-              ${amountCrypto.toFixed(18)}, 'locked',
-              (SELECT locked FROM balances WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${cryptoAsset}),
-              ${trade.id}, ${'trade:' + trade.id + ':platform_escrow_lock'},
-              'Platform market maker escrow'
-            )`,
-      );
+      // Platform seller: debit available, credit locked (mirror P2P escrow flow)
+      await mutateBalance(tx, {
+        userId: PLATFORM_USER_ID,
+        asset: cryptoAsset,
+        field: 'available',
+        amount: amountCrypto.negated().toFixed(18),
+        entryType: 'trade_escrow_lock',
+        idempotencyKey: `trade:${trade.id}:platform_escrow_lock:available`,
+        tradeId: trade.id,
+        note: 'Platform market maker escrow — debit available',
+        allowNegative: true,
+      });
+      await mutateBalance(tx, {
+        userId: PLATFORM_USER_ID,
+        asset: cryptoAsset,
+        field: 'locked',
+        amount: amountCrypto.toFixed(18),
+        entryType: 'trade_escrow_lock',
+        idempotencyKey: `trade:${trade.id}:platform_escrow_lock:locked`,
+        tradeId: trade.id,
+        note: 'Platform market maker escrow — credit locked',
+        allowNegative: true,
+      });
 
       return trade.id;
     });
 
-    // Publish trade event (sanitized — no buyerId/sellerId)
+    // Publish trade event with participant IDs for WebSocket routing
     await redis.publish(KEYS.tradeChannel, JSON.stringify({
       type: 'trade_created',
       tradeId,
+      buyerId,
+      sellerId: PLATFORM_USER_ID,
       status: 'escrow_funded',
     }));
 
     return tradeId;
   } catch (err: any) {
-    console.error('Platform fill failed:', err.message ?? err);
+    logger.error({ err }, 'Platform fill failed');
     return null;
   }
 }
@@ -231,12 +281,15 @@ export async function createPlatformBuyFill(
 ): Promise<string | null> {
   const amountCrypto = new Decimal(amountFiat).dividedBy(pricePerUnit);
   const feePercent = env.TAKER_FEE_PERCENT;
-  const feePerSide = amountCrypto.times(feePercent).dividedBy(100);
-  const totalFee = feePerSide.times(2);
+  const feePerSide = amountCrypto.times(feePercent).dividedBy(100).toDecimalPlaces(8, Decimal.ROUND_UP);
+  const baseTotalFee = feePerSide.times(2).toDecimalPlaces(8, Decimal.ROUND_UP);
 
   try {
     const tradeId = await db.transaction(async (tx) => {
       const now = new Date();
+
+      // Apply fee credits (seller pays the fee on sell orders)
+      const { adjustedFee: totalFee } = await applyFeeCredit(tx, sellerId, baseTotalFee, pricePerUnit);
 
       // Create trade — platform is the buyer, at escrow_funded
       const [trade] = await tx
@@ -287,7 +340,7 @@ export async function createPlatformBuyFill(
 
     return tradeId;
   } catch (err: any) {
-    console.error('Platform buy fill failed:', err.message ?? err);
+    logger.error({ err }, 'Platform buy fill failed');
     return null;
   }
 }
@@ -307,50 +360,42 @@ export async function createPlatformBuyFill(
  *   → Platform owes seller CAD (paid offline via Interac).
  */
 export async function autoAdvancePlatformTrade(tradeId: string): Promise<void> {
-  const [trade] = await db
-    .select()
-    .from(trades)
-    .where(eq(trades.id, tradeId));
+  const result = await db.transaction(async (tx) => {
+    // Lock the trade row to prevent concurrent advancement (admin + background job race)
+    await tx.execute(sql`SELECT id FROM trades WHERE id = ${tradeId} FOR UPDATE`);
+    const [trade] = await tx.select().from(trades).where(eq(trades.id, tradeId));
 
-  if (!trade) return;
+    if (!trade) return null;
+    if (trade.sellerId !== PLATFORM_USER_ID && trade.buyerId !== PLATFORM_USER_ID) return null;
 
-  // Only auto-advance if the platform is the seller or buyer
-  if (trade.sellerId !== PLATFORM_USER_ID && trade.buyerId !== PLATFORM_USER_ID) {
-    return;
-  }
+    const now = new Date();
+    const asset = trade.cryptoAsset;
+    const amountCrypto = trade.amountCrypto;
+    const feeAmount = trade.feeAmount;
 
-  const now = new Date();
-  const asset = trade.cryptoAsset;
-  const amountCrypto = trade.amountCrypto;
-  const feeAmount = trade.feeAmount;
+    // ─── Platform is SELLER, trade at payment_sent ────────────────────────
+    // Set a hold period so we can verify the Interac e-Transfer arrived.
+    if (trade.sellerId === PLATFORM_USER_ID && trade.status === 'payment_sent') {
+      const holdingUntil = new Date(now.getTime() + env.PLATFORM_VERIFY_MINUTES * 60 * 1000);
 
-  // ─── Platform is SELLER, trade at payment_sent ────────────────────────
-  // Instead of instant completion, set a hold period so we can verify
-  // the Interac e-Transfer actually arrived before releasing crypto.
-  if (trade.sellerId === PLATFORM_USER_ID && trade.status === 'payment_sent') {
-    const holdingUntil = new Date(now.getTime() + env.PLATFORM_VERIFY_MINUTES * 60 * 1000);
+      await tx
+        .update(trades)
+        .set({
+          status: 'payment_confirmed',
+          paymentConfirmedAt: now,
+          holdingUntil,
+          updatedAt: now,
+        })
+        .where(eq(trades.id, tradeId));
 
-    await db
-      .update(trades)
-      .set({
-        status: 'payment_confirmed',
-        paymentConfirmedAt: now,
-        holdingUntil,
-        updatedAt: now,
-      })
-      .where(eq(trades.id, tradeId));
+      return { newStatus: 'payment_confirmed', buyerId: trade.buyerId, sellerId: trade.sellerId, timestamp: now.toISOString() };
+    }
 
-    await redis.publish(KEYS.tradeChannel, JSON.stringify({
-      type: 'trade_status_changed',
-      tradeId,
-      newStatus: 'payment_confirmed',
-      timestamp: now.toISOString(),
-    }));
-  }
+    // ─── Platform is BUYER, trade at escrow_funded → instant complete ─────
+    if (trade.buyerId === PLATFORM_USER_ID && trade.status === 'escrow_funded') {
+      const totalFee = new Decimal(feeAmount);
+      const platformReceives = new Decimal(amountCrypto).minus(totalFee);
 
-  // ─── Platform is BUYER, trade at escrow_funded → instant complete ─────
-  if (trade.buyerId === PLATFORM_USER_ID && trade.status === 'escrow_funded') {
-    await db.transaction(async (tx) => {
       // Debit seller's locked
       await mutateBalance(tx, {
         userId: trade.sellerId,
@@ -361,6 +406,19 @@ export async function autoAdvancePlatformTrade(tradeId: string): Promise<void> {
         idempotencyKey: `trade:${tradeId}:release:seller_locked`,
         tradeId,
         note: `Sold ${amountCrypto} ${asset} to Maple Exchange`,
+      });
+
+      // Credit platform buyer with net crypto (after fee)
+      await mutateBalance(tx, {
+        userId: PLATFORM_USER_ID,
+        asset,
+        field: 'available',
+        amount: platformReceives.toFixed(18),
+        entryType: 'trade_credit',
+        idempotencyKey: `trade:${tradeId}:credit:platform_buyer`,
+        tradeId,
+        note: `Platform purchased ${platformReceives.toFixed(8)} ${asset}`,
+        allowNegative: true,
       });
 
       // Credit platform fee
@@ -381,13 +439,22 @@ export async function autoAdvancePlatformTrade(tradeId: string): Promise<void> {
 
       // Update seller stats
       await graduateUserLimit(tx, trade.sellerId);
-    });
 
+      return { newStatus: 'completed', buyerId: trade.buyerId, sellerId: trade.sellerId, timestamp: now.toISOString() };
+    }
+
+    return null;
+  });
+
+  // Publish trade event outside the transaction (Redis pub/sub)
+  if (result) {
     await redis.publish(KEYS.tradeChannel, JSON.stringify({
       type: 'trade_status_changed',
       tradeId,
-      newStatus: 'completed',
-      timestamp: now.toISOString(),
+      buyerId: result.buyerId,
+      sellerId: result.sellerId,
+      newStatus: result.newStatus,
+      timestamp: result.timestamp,
     }));
   }
 }
@@ -403,33 +470,37 @@ export async function autoAdvancePlatformTrade(tradeId: string): Promise<void> {
  * Debits platform locked, credits buyer available (minus fee), credits platform fee.
  */
 export async function completePlatformSellTrade(tradeId: string): Promise<void> {
-  const [trade] = await db
-    .select()
-    .from(trades)
-    .where(eq(trades.id, tradeId));
+  const completed = await db.transaction(async (tx) => {
+    // Lock the trade row to prevent concurrent completion (admin verify + background job race)
+    await tx.execute(sql`SELECT id FROM trades WHERE id = ${tradeId} FOR UPDATE`);
+    const [trade] = await tx.select().from(trades).where(eq(trades.id, tradeId));
 
-  if (!trade) return;
-  if (trade.sellerId !== PLATFORM_USER_ID) return;
-  if (trade.status !== 'payment_confirmed') return;
+    if (!trade) return false;
+    if (trade.sellerId !== PLATFORM_USER_ID) return false;
+    if (trade.status !== 'payment_confirmed') return false;
 
-  const now = new Date();
-  const asset = trade.cryptoAsset;
-  const amountCrypto = trade.amountCrypto;
-  const feeAmount = trade.feeAmount;
+    const now = new Date();
+    const asset = trade.cryptoAsset;
+    const amountCrypto = trade.amountCrypto;
+    const feeAmount = trade.feeAmount;
 
-  await db.transaction(async (tx) => {
-    const feePerSide = new Decimal(feeAmount).dividedBy(2);
-    const buyerReceives = new Decimal(amountCrypto).minus(feePerSide);
+    const totalFee = new Decimal(feeAmount);
+    const buyerReceives = new Decimal(amountCrypto).minus(totalFee);
 
-    // Debit platform's locked balance (allowed to go negative)
-    await tx.execute(
-      sql`UPDATE balances
-          SET locked = locked::numeric - ${new Decimal(amountCrypto).toFixed(18)}::numeric,
-              updated_at = NOW()
-          WHERE user_id = ${PLATFORM_USER_ID} AND asset = ${asset}`,
-    );
+    // Debit platform's locked balance (allowed to go negative for market maker)
+    await mutateBalance(tx, {
+      userId: PLATFORM_USER_ID,
+      asset,
+      field: 'locked',
+      amount: new Decimal(amountCrypto).negated().toFixed(18),
+      entryType: 'trade_escrow_release',
+      idempotencyKey: `trade:${tradeId}:release:platform_locked`,
+      tradeId,
+      note: `Platform market maker escrow release`,
+      allowNegative: true,
+    });
 
-    // Credit buyer's available balance
+    // Credit buyer's available balance (amountCrypto minus total fee)
     await mutateBalance(tx, {
       userId: trade.buyerId,
       asset,
@@ -457,12 +528,18 @@ export async function completePlatformSellTrade(tradeId: string): Promise<void> 
 
     // Update buyer stats
     await graduateUserLimit(tx, trade.buyerId);
+
+    return { buyerId: trade.buyerId };
   });
 
-  await redis.publish(KEYS.tradeChannel, JSON.stringify({
-    type: 'trade_status_changed',
-    tradeId,
-    newStatus: 'completed',
-    timestamp: now.toISOString(),
-  }));
+  if (completed) {
+    await redis.publish(KEYS.tradeChannel, JSON.stringify({
+      type: 'trade_status_changed',
+      tradeId,
+      buyerId: completed.buyerId,
+      sellerId: PLATFORM_USER_ID,
+      newStatus: 'completed',
+      timestamp: new Date().toISOString(),
+    }));
+  }
 }

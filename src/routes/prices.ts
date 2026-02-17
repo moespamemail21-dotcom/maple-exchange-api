@@ -1,6 +1,7 @@
+import { logger } from '../config/logger.js';
 import { FastifyInstance } from 'fastify';
 import axios from 'axios';
-import { getAllPricesCached, getPrice } from '../services/price.js';
+import { getAllPricesCached, getPrice, getCandles } from '../services/price.js';
 import { redis, KEYS } from '../services/redis.js';
 import { env } from '../config/env.js';
 
@@ -29,6 +30,35 @@ export async function priceRoutes(app: FastifyInstance) {
       return reply.status(404).send({ error: `Price not available for ${symbol}` });
     }
     return price;
+  });
+
+  // ─── Get Live Candles (1m, from MEXC feed) ───────────────────────────
+  app.get('/api/prices/:symbol/candles', async (request, reply) => {
+    const { symbol } = request.params as { symbol: string };
+    const { interval = '1m', limit = '60' } = request.query as { interval?: string; limit?: string };
+
+    const candles = await getCandles(symbol.toUpperCase(), interval);
+    if (!candles) {
+      return reply.status(404).send({ error: 'Candle data not available yet' });
+    }
+
+    return {
+      symbol: symbol.toUpperCase(),
+      interval,
+      candles: candles.slice(-Math.min(parseInt(limit) || 60, 200)),
+    };
+  });
+
+  // ─── Get Order Book Snapshot (REST fallback) ─────────────────────────
+  app.get('/api/prices/:symbol/orderbook', async (request, reply) => {
+    const { symbol } = request.params as { symbol: string };
+    const upper = symbol.toUpperCase();
+
+    const cached = await redis.get(KEYS.orderbookSnapshot(upper));
+    if (!cached) {
+      return reply.status(404).send({ error: 'Order book not available yet' });
+    }
+    return JSON.parse(cached);
   });
 
   // ─── Get Price Chart (Historical) ─────────────────────────────────────
@@ -71,7 +101,7 @@ export async function priceRoutes(app: FastifyInstance) {
 
       return result;
     } catch (err) {
-      console.error('Chart fetch error:', err instanceof Error ? err.message : err);
+      logger.error({ err }, 'Chart fetch failed');
       return reply.status(502).send({ error: 'Unable to fetch chart data' });
     }
   });

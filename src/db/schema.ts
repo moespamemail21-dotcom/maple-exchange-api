@@ -22,7 +22,7 @@ export const users = pgTable('users', {
   displayName: varchar('display_name', { length: 100 }),
 
   // KYC
-  kycStatus: varchar('kyc_status', { length: 20 }).default('pending').notNull(),
+  kycStatus: varchar('kyc_status', { length: 20 }).default('not_submitted').notNull(),
   kycProviderId: varchar('kyc_provider_id', { length: 255 }),
   kycVideoStatus: varchar('kyc_video_status', { length: 20 }).default('not_submitted').notNull(),
 
@@ -31,6 +31,9 @@ export const users = pgTable('users', {
   completionRate: decimal('completion_rate', { precision: 5, scale: 2 }).default('100.00').notNull(),
   avgConfirmSeconds: integer('avg_confirm_seconds'),
   maxTradeLimit: decimal('max_trade_limit', { precision: 12, scale: 2 }).default('250.00').notNull(),
+
+  // Referral fee credits (CAD)
+  feeCreditCad: decimal('fee_credit_cad', { precision: 12, scale: 2 }).default('0.00').notNull(),
 
   // Interac
   interacEmail: varchar('interac_email', { length: 255 }),
@@ -43,14 +46,22 @@ export const users = pgTable('users', {
   refreshToken: varchar('refresh_token', { length: 512 }),
   twoFactorSecret: varchar('two_factor_secret', { length: 64 }),
   twoFactorEnabled: boolean('two_factor_enabled').default(false).notNull(),
+  twoFactorBackupCodes: text('two_factor_backup_codes'), // JSON array of bcrypt-hashed single-use backup codes
 
   // PIN & Biometric
   pinHash: varchar('pin_hash', { length: 255 }),
   biometricTokenHash: varchar('biometric_token_hash', { length: 255 }),
 
+  // Account Lockout
+  failedLoginAttempts: integer('failed_login_attempts').default(0).notNull(),
+  lockedUntil: timestamp('locked_until', { withTimezone: true }),
+
   // Password Reset
   resetToken: varchar('reset_token', { length: 255 }),
   resetTokenExpiry: timestamp('reset_token_expiry', { withTimezone: true }),
+
+  // Security: withdrawal cooldown after password change
+  passwordChangedAt: timestamp('password_changed_at', { withTimezone: true }),
 
   // Compliance (CARF)
   fullLegalName: varchar('full_legal_name', { length: 255 }),
@@ -65,7 +76,9 @@ export const users = pgTable('users', {
 
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
-});
+}, (table) => [
+  index('users_kyc_status_idx').on(table.kycStatus),
+]);
 
 // ─── Orders (Buy/Sell advertisements on the book) ───────────────────────────
 export const orders = pgTable('orders', {
@@ -98,6 +111,7 @@ export const orders = pgTable('orders', {
 }, (table) => [
   index('orders_user_id_idx').on(table.userId),
   index('orders_status_type_idx').on(table.status, table.type, table.cryptoAsset),
+  index('orders_created_at_idx').on(table.createdAt),
 ]);
 
 // ─── Trades (Matched buyer <-> seller) ──────────────────────────────────────
@@ -146,6 +160,10 @@ export const trades = pgTable('trades', {
   index('trades_seller_id_idx').on(table.sellerId),
   index('trades_order_id_idx').on(table.orderId),
   index('trades_status_idx').on(table.status),
+  index('trades_created_at_idx').on(table.createdAt),
+  index('trades_buyer_created_idx').on(table.buyerId, table.createdAt),
+  index('trades_seller_created_idx').on(table.sellerId, table.createdAt),
+  index('trades_status_created_idx').on(table.status, table.createdAt),
 ]);
 
 // ─── Disputes ───────────────────────────────────────────────────────────────
@@ -267,6 +285,7 @@ export const balanceLedger = pgTable('balance_ledger', {
   index('ledger_withdrawal_id_idx').on(table.withdrawalId),
   index('ledger_trade_id_idx').on(table.tradeId),
   index('ledger_created_at_idx').on(table.createdAt),
+  index('ledger_entry_type_created_idx').on(table.entryType, table.createdAt),
 ]);
 
 // ─── Deposits (Incoming crypto from external wallets) ───────────────────────
@@ -288,7 +307,7 @@ export const deposits = pgTable('deposits', {
   // BTC: 2, ETH/LINK: 12, LTC: 6, XRP: 1, SOL: 32
 
   status: varchar('status', { length: 20 }).default('pending').notNull(),
-  // 'pending' | 'confirmed' | 'credited' | 'failed'
+  // 'pending' | 'confirming' | 'confirmed' | 'credited' | 'failed'
 
   detectedAt: timestamp('detected_at', { withTimezone: true }).defaultNow().notNull(),
   confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
@@ -338,6 +357,7 @@ export const withdrawals = pgTable('withdrawals', {
   index('withdrawals_user_id_idx').on(table.userId),
   index('withdrawals_status_idx').on(table.status),
   index('withdrawals_user_requested_at_idx').on(table.userId, table.requestedAt),
+  index('withdrawals_requested_at_idx').on(table.requestedAt),
 ]);
 
 // ─── KYC Documents (Photos, videos for identity verification) ───────────────
@@ -404,6 +424,31 @@ export const tradeMessages = pgTable('trade_messages', {
   index('trade_messages_trade_idx').on(table.tradeId),
 ]);
 
+// ─── Saved Addresses (Address Book) ─────────────────────────────────────────
+export const savedAddresses = pgTable('saved_addresses', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+
+  label: varchar('label', { length: 50 }).notNull(),
+  // User-friendly name like "My Ledger", "Coinbase", etc.
+
+  asset: varchar('asset', { length: 10 }).notNull(),
+  // 'BTC' | 'ETH' | 'LTC' | 'XRP' | 'SOL' | 'LINK'
+
+  address: varchar('address', { length: 255 }).notNull(),
+  destinationTag: varchar('destination_tag', { length: 20 }),
+  // Only for XRP
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('saved_addresses_user_idx').on(table.userId),
+  index('saved_addresses_user_asset_idx').on(table.userId, table.asset),
+]);
+
+export const savedAddressesRelations = relations(savedAddresses, ({ one }) => ({
+  user: one(users, { fields: [savedAddresses.userId], references: [users.id] }),
+}));
+
 // ─── Relations ──────────────────────────────────────────────────────────────
 
 export const usersRelations = relations(users, ({ many }) => ({
@@ -415,6 +460,9 @@ export const usersRelations = relations(users, ({ many }) => ({
   deposits: many(deposits),
   withdrawals: many(withdrawals),
   kycDocuments: many(kycDocuments),
+  savedAddresses: many(savedAddresses),
+  sessions: many(sessions),
+  supportTickets: many(supportTickets),
 }));
 
 export const ordersRelations = relations(orders, ({ one, many }) => ({
@@ -634,4 +682,225 @@ export const userPreferencesRelations = relations(userPreferences, ({ one }) => 
 
 export const notificationsRelations = relations(notifications, ({ one }) => ({
   user: one(users, { fields: [notifications.userId], references: [users.id] }),
+}));
+
+// ─── Auth Events (Audit log for all authentication actions) ─────────────
+export const authEvents = pgTable('auth_events', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id),
+  // Nullable: login_failed events may not have a resolved userId
+
+  eventType: varchar('event_type', { length: 40 }).notNull(),
+  // 'register' | 'login' | 'login_failed' | 'logout'
+  // | 'password_reset_request' | 'password_reset_complete'
+  // | 'pin_set' | 'pin_verify' | 'pin_verify_failed'
+  // | 'biometric_register' | 'biometric_verify' | 'biometric_verify_failed'
+  // | 'token_refresh' | 'token_refresh_failed'
+
+  ipAddress: varchar('ip_address', { length: 45 }),
+  userAgent: text('user_agent'),
+  success: boolean('success').default(true).notNull(),
+  metadata: jsonb('metadata').$type<Record<string, unknown>>(),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('auth_events_user_id_idx').on(table.userId),
+  index('auth_events_event_type_idx').on(table.eventType),
+  index('auth_events_created_at_idx').on(table.createdAt),
+]);
+
+export const authEventsRelations = relations(authEvents, ({ one }) => ({
+  user: one(users, { fields: [authEvents.userId], references: [users.id] }),
+}));
+
+// ─── Price Alerts ────────────────────────────────────────────────────────────
+export const priceAlerts = pgTable('price_alerts', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+
+  asset: varchar('asset', { length: 10 }).notNull(),
+  // 'BTC' | 'ETH' | 'LTC' | 'XRP' | 'SOL' | 'LINK'
+
+  targetPrice: decimal('target_price', { precision: 18, scale: 2 }).notNull(),
+  direction: varchar('direction', { length: 5 }).notNull(),
+  // 'above' | 'below'
+
+  triggered: boolean('triggered').default(false).notNull(),
+  triggeredAt: timestamp('triggered_at', { withTimezone: true }),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('price_alerts_user_id_idx').on(table.userId),
+  index('price_alerts_active_idx').on(table.triggered, table.asset),
+]);
+
+export const priceAlertsRelations = relations(priceAlerts, ({ one }) => ({
+  user: one(users, { fields: [priceAlerts.userId], references: [users.id] }),
+}));
+
+// ─── Recurring Buys (DCA) ────────────────────────────────────────────────────
+export const recurringBuys = pgTable('recurring_buys', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+
+  asset: varchar('asset', { length: 10 }).notNull(),
+  amountCad: decimal('amount_cad', { precision: 12, scale: 2 }).notNull(),
+
+  frequency: varchar('frequency', { length: 10 }).notNull(),
+  // 'daily' | 'weekly' | 'biweekly' | 'monthly'
+
+  status: varchar('status', { length: 10 }).default('active').notNull(),
+  // 'active' | 'paused' | 'cancelled'
+
+  nextRunAt: timestamp('next_run_at', { withTimezone: true }).notNull(),
+  lastRunAt: timestamp('last_run_at', { withTimezone: true }),
+
+  totalBought: decimal('total_bought', { precision: 28, scale: 18 }).default('0').notNull(),
+  totalSpent: decimal('total_spent', { precision: 12, scale: 2 }).default('0').notNull(),
+  executionCount: integer('execution_count').default(0).notNull(),
+  consecutiveFailures: integer('consecutive_failures').default(0).notNull(),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('recurring_buys_user_idx').on(table.userId),
+  index('recurring_buys_next_run_idx').on(table.nextRunAt, table.status),
+]);
+
+export const recurringBuysRelations = relations(recurringBuys, ({ one }) => ({
+  user: one(users, { fields: [recurringBuys.userId], references: [users.id] }),
+}));
+
+// ─── Referral System ─────────────────────────────────────────────────────────
+export const referralCodes = pgTable('referral_codes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id).notNull().unique(),
+
+  code: varchar('code', { length: 20 }).unique().notNull(),
+  usedCount: integer('used_count').default(0).notNull(),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex('referral_codes_code_idx').on(table.code),
+  uniqueIndex('referral_codes_user_idx').on(table.userId),
+]);
+
+export const referralRewards = pgTable('referral_rewards', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  referrerId: uuid('referrer_id').references(() => users.id).notNull(),
+  refereeId: uuid('referee_id').references(() => users.id).notNull().unique(),
+
+  rewardAsset: varchar('reward_asset', { length: 10 }).default('CAD').notNull(),
+  rewardAmount: decimal('reward_amount', { precision: 12, scale: 2 }).notNull(),
+
+  status: varchar('status', { length: 20 }).default('pending').notNull(),
+  // 'pending' | 'credited' | 'expired'
+
+  creditedAt: timestamp('credited_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('referral_rewards_referrer_idx').on(table.referrerId),
+  index('referral_rewards_referee_idx').on(table.refereeId),
+]);
+
+// ─── Device Tokens (Push notification registration) ──────────────────────────
+export const deviceTokens = pgTable('device_tokens', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+
+  token: text('token').unique().notNull(),
+  platform: varchar('platform', { length: 10 }).notNull(),
+  // 'ios' | 'android'
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('device_tokens_user_id_idx').on(table.userId),
+  uniqueIndex('device_tokens_token_idx').on(table.token),
+]);
+
+export const referralCodesRelations = relations(referralCodes, ({ one }) => ({
+  user: one(users, { fields: [referralCodes.userId], references: [users.id] }),
+}));
+
+export const referralRewardsRelations = relations(referralRewards, ({ one }) => ({
+  referrer: one(users, { fields: [referralRewards.referrerId], references: [users.id], relationName: 'referrer' }),
+  referee: one(users, { fields: [referralRewards.refereeId], references: [users.id], relationName: 'referee' }),
+}));
+
+export const deviceTokensRelations = relations(deviceTokens, ({ one }) => ({
+  user: one(users, { fields: [deviceTokens.userId], references: [users.id] }),
+}));
+
+
+// ─── Support Tickets ────────────────────────────────────────────────────────
+export const supportTickets = pgTable('support_tickets', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+
+  subject: varchar('subject', { length: 255 }).notNull(),
+  category: varchar('category', { length: 30 }).notNull(),
+  // 'account' | 'trading' | 'deposit' | 'withdrawal' | 'security' | 'other'
+
+  status: varchar('status', { length: 20 }).default('open').notNull(),
+  // 'open' | 'in_progress' | 'resolved' | 'closed'
+
+  priority: varchar('priority', { length: 10 }).default('normal').notNull(),
+  // 'low' | 'normal' | 'high' | 'urgent'
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+}, (table) => [
+  index('support_tickets_user_idx').on(table.userId),
+  index('support_tickets_status_idx').on(table.status),
+  index('support_tickets_created_at_idx').on(table.createdAt),
+]);
+
+export const ticketMessages = pgTable('ticket_messages', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  ticketId: uuid('ticket_id').references(() => supportTickets.id).notNull(),
+  senderId: uuid('sender_id').references(() => users.id).notNull(),
+
+  content: text('content').notNull(),
+  isStaff: boolean('is_staff').default(false).notNull(),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('ticket_messages_ticket_idx').on(table.ticketId),
+]);
+
+export const supportTicketsRelations = relations(supportTickets, ({ one, many }) => ({
+  user: one(users, { fields: [supportTickets.userId], references: [users.id] }),
+  messages: many(ticketMessages),
+}));
+
+export const ticketMessagesRelations = relations(ticketMessages, ({ one }) => ({
+  ticket: one(supportTickets, { fields: [ticketMessages.ticketId], references: [supportTickets.id] }),
+  sender: one(users, { fields: [ticketMessages.senderId], references: [users.id] }),
+}));
+
+// ─── Sessions (Active login sessions for session management) ──────────────
+export const sessions = pgTable('sessions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id).notNull(),
+
+  refreshToken: varchar('refresh_token', { length: 512 }).notNull(),
+
+  ipAddress: varchar('ip_address', { length: 45 }),
+  userAgent: text('user_agent'),
+  deviceName: varchar('device_name', { length: 100 }),
+
+  lastActiveAt: timestamp('last_active_at', { withTimezone: true }).defaultNow().notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  index('sessions_user_id_idx').on(table.userId),
+  index('sessions_expires_at_idx').on(table.expiresAt),
+  index('sessions_user_expires_idx').on(table.userId, table.expiresAt),
+]);
+
+export const sessionsRelations = relations(sessions, ({ one }) => ({
+  user: one(users, { fields: [sessions.userId], references: [users.id] }),
 }));

@@ -2,29 +2,29 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '../db/index.js';
 import { users, kycDocuments } from '../db/schema.js';
-import { eq, desc } from 'drizzle-orm';
+import { eq, desc, sql } from 'drizzle-orm';
 import { authGuard } from '../middleware/auth.js';
 import { storeFile, validateUpload } from '../services/storage.js';
 import { getUserById } from '../services/auth.js';
 
 const updateProfileSchema = z.object({
-  displayName: z.string().min(1).max(100).optional(),
-  interacEmail: z.string().email().optional(),
+  displayName: z.string().trim().min(1).max(100).optional(),
+  interacEmail: z.string().trim().email().optional(),
   locale: z.enum(['en', 'fr']).optional(),
-  phone: z.string().min(10).max(20).optional(),
+  phone: z.string().trim().min(10).max(20).optional(),
 });
 
 const kycSubmitSchema = z.object({
   // Accept either fullLegalName OR firstName+lastName (iOS sends the latter)
-  fullLegalName: z.string().min(2).max(255).optional(),
-  firstName: z.string().min(1).max(100).optional(),
-  lastName: z.string().min(1).max(100).optional(),
+  fullLegalName: z.string().trim().min(2).max(255).optional(),
+  firstName: z.string().trim().min(1).max(100).optional(),
+  lastName: z.string().trim().min(1).max(100).optional(),
   dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  address: z.string().min(5).max(500),
-  city: z.string().min(1).max(100).optional(),
+  address: z.string().trim().min(5).max(500),
+  city: z.string().trim().min(1).max(100).optional(),
   province: z.string().length(2).optional(),
-  postalCode: z.string().min(3).max(10).optional(),
-  occupation: z.string().max(100).optional(),
+  postalCode: z.string().trim().min(3).max(10).optional(),
+  occupation: z.string().trim().max(100).optional(),
   sin: z.string().regex(/^\d{3}-?\d{3}-?\d{3}$/).optional(),
 }).refine(
   (data) => data.fullLegalName || (data.firstName && data.lastName),
@@ -38,9 +38,22 @@ export async function userRoutes(app: FastifyInstance) {
   const updateProfileHandler = async (request: any) => {
     const body = updateProfileSchema.parse(request.body);
 
+    // If interacEmail is changing, reset autodepositVerified to force re-verification.
+    // This prevents a compromised session from redirecting sell proceeds silently.
+    const updateData: Record<string, any> = { ...body, updatedAt: new Date() };
+    if (body.interacEmail) {
+      const [currentUser] = await db
+        .select({ interacEmail: users.interacEmail })
+        .from(users)
+        .where(eq(users.id, request.userId));
+      if (currentUser && currentUser.interacEmail !== body.interacEmail) {
+        updateData.autodepositVerified = false;
+      }
+    }
+
     await db
       .update(users)
-      .set({ ...body, updatedAt: new Date() })
+      .set(updateData)
       .where(eq(users.id, request.userId));
 
     // Return full user object so iOS can decode as User struct
@@ -52,34 +65,66 @@ export async function userRoutes(app: FastifyInstance) {
   app.post('/api/user/profile', { preHandler: [authGuard] }, updateProfileHandler);
 
   // ─── Submit KYC Data (CARF compliance) ────────────────────────────────
-  app.post('/api/user/kyc', { preHandler: [authGuard] }, async (request, reply) => {
+  app.post('/api/user/kyc', {
+    config: { rateLimit: { max: 3, timeWindow: '15 minutes' } },
+    preHandler: [authGuard],
+  }, async (request, reply) => {
     const body = kycSubmitSchema.parse(request.body);
 
     // Merge firstName+lastName into fullLegalName (iOS sends these separately)
     const fullLegalName = body.fullLegalName ?? `${body.firstName} ${body.lastName}`;
 
-    await db
-      .update(users)
-      .set({
-        fullLegalName,
-        dateOfBirth: body.dateOfBirth,
-        address: body.address,
-        city: body.city ?? null,
-        province: body.province ?? null,
-        postalCode: body.postalCode ?? null,
-        occupation: body.occupation ?? null,
-        sin: body.sin ?? null,
-        // Auto-verify for MVP — real verification would involve document review
-        kycStatus: 'verified',
-        updatedAt: new Date(),
-      })
-      .where(eq(users.id, request.userId));
+    // Atomic: check status + update inside transaction with row lock
+    const result = await db.transaction(async (tx) => {
+      const lockResult = await tx.execute(
+        sql`SELECT kyc_status FROM users WHERE id = ${request.userId} FOR UPDATE`,
+      ) as any;
+      const rows = Array.isArray(lockResult) ? lockResult : lockResult?.rows ?? [];
+      const kycStatus = rows[0]?.kyc_status;
 
-    return { status: 'verified', message: 'KYC verified successfully.' };
+      if (kycStatus === 'verified') {
+        return { error: 'KYC already verified. Contact support to update.', code: 409 } as const;
+      }
+      if (kycStatus === 'pending') {
+        return { error: 'KYC already submitted and under review.', code: 409 } as const;
+      }
+
+      await tx
+        .update(users)
+        .set({
+          fullLegalName,
+          dateOfBirth: body.dateOfBirth,
+          address: body.address,
+          city: body.city ?? null,
+          province: body.province ?? null,
+          postalCode: body.postalCode ?? null,
+          occupation: body.occupation ?? null,
+          sin: body.sin ? body.sin.replace(/-/g, '') : null,
+          kycStatus: 'pending',
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, request.userId));
+
+      return { success: true } as const;
+    });
+
+    if ('error' in result && 'code' in result) {
+      return reply.status(result.code as number).send({ error: result.error });
+    }
+
+    return { status: 'pending', message: 'KYC submitted. Under review.' };
   });
 
   // ─── Upload KYC Document (video/photo) ──────────────────────────────
   app.post('/api/user/kyc/document', { preHandler: [authGuard] }, async (request, reply) => {
+    // Before processing upload, check document count
+    const existingDocs = await db.select({ id: kycDocuments.id })
+      .from(kycDocuments)
+      .where(eq(kycDocuments.userId, request.userId));
+    if (existingDocs.length >= 10) {
+      return reply.status(429).send({ error: 'Maximum document upload limit reached (10). Contact support.' });
+    }
+
     const data = await request.file();
     if (!data) {
       return reply.status(400).send({ error: 'No file uploaded. Use multipart/form-data.' });
@@ -145,6 +190,10 @@ export async function userRoutes(app: FastifyInstance) {
 
   // ─── List KYC Documents ─────────────────────────────────────────────
   app.get('/api/user/kyc/documents', { preHandler: [authGuard] }, async (request) => {
+    const query = request.query as { limit?: string; offset?: string };
+    const limit = Math.min(Number(query.limit) || 20, 100);
+    const offset = Math.max(Number(query.offset) || 0, 0);
+
     const docs = await db
       .select({
         id: kycDocuments.id,
@@ -158,15 +207,29 @@ export async function userRoutes(app: FastifyInstance) {
       })
       .from(kycDocuments)
       .where(eq(kycDocuments.userId, request.userId))
-      .orderBy(desc(kycDocuments.uploadedAt));
+      .orderBy(desc(kycDocuments.uploadedAt))
+      .limit(limit)
+      .offset(offset);
 
     return { documents: docs };
   });
 
   // ─── Verify Autodeposit (Self-attestation for MVP) ────────────────────
-  app.post('/api/user/verify-autodeposit', { preHandler: [authGuard] }, async (request, reply) => {
-    // iOS sends { interacEmail } — store it and verify in one call
-    const body = request.body as { interacEmail?: string } | undefined;
+  const verifyAutodepositSchema = z.object({
+    interacEmail: z.string().email().optional(),
+  }).optional();
+
+  app.post('/api/user/verify-autodeposit', {
+    config: { rateLimit: { max: 5, timeWindow: '15 minutes' } },
+    preHandler: [authGuard],
+  }, async (request, reply) => {
+    // Must be KYC verified before enabling autodeposit (required for selling)
+    const [currentUser] = await db.select().from(users).where(eq(users.id, request.userId));
+    if (!currentUser || currentUser.kycStatus !== 'verified') {
+      return reply.status(403).send({ error: 'Complete identity verification (KYC) before enabling autodeposit.' });
+    }
+
+    const body = verifyAutodepositSchema.parse(request.body);
     const emailFromBody = body?.interacEmail;
 
     if (emailFromBody) {

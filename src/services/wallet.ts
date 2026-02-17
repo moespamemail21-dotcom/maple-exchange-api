@@ -23,7 +23,7 @@ export const CHAIN_ASSETS: Record<Chain, string[]> = {
 };
 
 export const REQUIRED_CONFIRMATIONS: Record<Chain, number> = {
-  bitcoin: 2,
+  bitcoin: 3,
   ethereum: 12,
   litecoin: 6,
   xrp: 1,
@@ -298,7 +298,14 @@ export function validateAddress(chain: Chain, address: string): boolean {
     case 'bitcoin':
       return /^(bc1q[a-z0-9]{38,62}|bc1p[a-z0-9]{58}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$/.test(address);
     case 'ethereum':
-      return /^0x[0-9a-fA-F]{40}$/.test(address);
+      // Use ethers.js getAddress() for full EIP-55 checksum validation.
+      // This also covers ERC-20 tokens (LINK) that share Ethereum addresses.
+      try {
+        ethers.getAddress(address);
+        return true;
+      } catch {
+        return false;
+      }
     case 'litecoin':
       return /^(ltc1q[a-z0-9]{38,62}|[LM3][a-km-zA-HJ-NP-Z1-9]{25,34})$/.test(address);
     case 'xrp':

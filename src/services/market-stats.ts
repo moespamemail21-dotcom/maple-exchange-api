@@ -1,3 +1,4 @@
+import { logger } from '../config/logger.js';
 import axios from 'axios';
 import { redis } from './redis.js';
 import { env } from '../config/env.js';
@@ -66,7 +67,7 @@ export async function fetchMarketStats(): Promise<MarketStats | null> {
 
     return stats;
   } catch (err) {
-    console.error('Market stats fetch failed:', err instanceof Error ? err.message : err);
+    logger.error({ err }, 'Market stats fetch failed');
     return memoryCache;
   }
 }

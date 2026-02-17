@@ -1,3 +1,4 @@
+import { logger } from '../config/logger.js';
 import { sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { wallets } from '../db/schema.js';
@@ -11,7 +12,7 @@ export async function claimPoolWallets(tx: any, userId: string): Promise<void> {
   for (const chain of CHAINS) {
     const claimed = await claimOneWallet(tx, userId, chain);
     if (!claimed) {
-      console.warn(`[WALLET POOL] Pool exhausted for chain=${chain} — falling back to on-demand generation`);
+      logger.warn({ chain }, 'Wallet pool exhausted — falling back to on-demand generation');
       await generateOnDemandWallet(tx, userId, chain);
     }
   }

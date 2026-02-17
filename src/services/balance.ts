@@ -1,6 +1,8 @@
 import { eq, and, sql, desc } from 'drizzle-orm';
 import { db, type DB } from '../db/index.js';
 import { balances, balanceLedger } from '../db/schema.js';
+import { logger } from '../config/logger.js';
+import { redis, KEYS } from './redis.js';
 import Decimal from 'decimal.js';
 import type { PgTransaction } from 'drizzle-orm/pg-core';
 import type postgres from 'postgres';
@@ -25,6 +27,8 @@ export interface BalanceMutation {
   withdrawalId?: string;
   tradeId?: string;
   note?: string;
+  /** Allow the resulting balance to go negative (platform market-maker only) */
+  allowNegative?: boolean;
 }
 
 const FIELD_COLUMN_MAP = {
@@ -94,8 +98,8 @@ export async function mutateBalance(
   const mutationAmount = new Decimal(amount);
   const newValue = currentValue.plus(mutationAmount);
 
-  // 3. Reject if result would be negative
-  if (newValue.isNegative()) {
+  // 3. Reject if result would be negative (unless explicitly allowed for platform user)
+  if (newValue.isNegative() && !mutation.allowNegative) {
     throw new Error(
       `Insufficient ${field} balance for ${asset}: current=${currentValue.toFixed()}, ` +
       `mutation=${mutationAmount.toFixed()}, would result in ${newValue.toFixed()}`
@@ -126,6 +130,18 @@ export async function mutateBalance(
     idempotencyKey,
     note: mutation.note ?? null,
   });
+
+  logger.info({ userId, asset, field, amount, entryType }, 'balance mutation');
+
+  // Queue a balance update event (fire-and-forget, outside tx commit).
+  // If the transaction rolls back the user will re-fetch correct state on next poll.
+  redis.publish(KEYS.balanceChannel, JSON.stringify({
+    type: 'balance_updated',
+    userId,
+    asset,
+    field,
+    entryType,
+  })).catch(() => { /* non-critical */ });
 
   return newValueStr;
 }
@@ -160,9 +176,11 @@ export async function getUserBalances(userId: string) {
 
 /**
  * Get a single asset balance for a user.
+ * Optionally accepts a transaction for use inside db.transaction() blocks.
  */
-export async function getUserBalance(userId: string, asset: string) {
-  const [row] = await db
+export async function getUserBalance(userId: string, asset: string, txn?: any) {
+  const queryDb = txn ?? db;
+  const [row] = await queryDb
     .select({
       asset: balances.asset,
       available: balances.available,

@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { db } from '../db/index.js';
-import { trades, disputes, balances, users, complianceLogs, withdrawals, wallets, orders } from '../db/schema.js';
+import { trades, disputes, balances, users, complianceLogs, withdrawals, wallets, orders, authEvents, kycDocuments, stakingPositions, stakingProducts, deposits, notifications } from '../db/schema.js';
 import { eq, and, desc, ne, gt, sql } from 'drizzle-orm';
 import { adminGuard } from '../middleware/auth.js';
 import { transitionTrade } from '../services/trade.js';
@@ -18,6 +18,19 @@ const resolveSchema = z.object({
   resolution: z.enum(['buyer_wins', 'seller_wins']),
   note: z.string().max(2000).optional(),
 });
+
+const uuidParamSchema = z.object({ id: z.string().uuid() });
+const recoverKeySchema = z.object({ walletId: z.string().uuid() });
+const rejectPaymentSchema = z.object({ reason: z.string().max(2000).optional() });
+const manualMatchSchema = z.object({ buyOrderId: z.string().uuid(), sellOrderId: z.string().uuid() });
+const rejectWithdrawalSchema = z.object({ reason: z.string().max(2000).optional() });
+const kycStatusSchema = z.object({ status: z.enum(['verified', 'rejected']), note: z.string().max(2000).optional() });
+
+const VALID_TRADE_STATUSES = ['pending', 'escrow_funded', 'payment_sent', 'payment_confirmed', 'crypto_released', 'completed', 'expired', 'cancelled', 'disputed', 'resolved_buyer', 'resolved_seller'] as const;
+const VALID_ORDER_STATUSES = ['active', 'paused', 'filled', 'cancelled'] as const;
+const VALID_ORDER_TYPES = ['buy', 'sell'] as const;
+const VALID_ASSETS = ['BTC', 'ETH', 'LTC', 'XRP', 'SOL', 'LINK'] as const;
+const VALID_WITHDRAWAL_STATUSES = ['pending_review', 'approved', 'broadcasting', 'confirmed', 'failed', 'cancelled'] as const;
 
 export async function adminRoutes(app: FastifyInstance) {
   // ─── List Open Disputes ─────────────────────────────────────────────
@@ -49,7 +62,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   // ─── Get Single Dispute ─────────────────────────────────────────────
   app.get('/api/admin/disputes/:id', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
+    const { id } = uuidParamSchema.parse(request.params);
 
     const [dispute] = await db
       .select()
@@ -71,8 +84,11 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ─── Resolve Dispute ────────────────────────────────────────────────
-  app.post('/api/admin/disputes/:id/resolve', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
+  app.post('/api/admin/disputes/:id/resolve', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
     const body = resolveSchema.parse(request.body);
 
     const [dispute] = await db.select().from(disputes).where(eq(disputes.id, id));
@@ -112,8 +128,11 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ─── Verify Payment (Admin confirms Interac received → instant complete) ──
-  app.post('/api/admin/trades/:id/verify-payment', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
+  app.post('/api/admin/trades/:id/verify-payment', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
 
     const [trade] = await db.select().from(trades).where(eq(trades.id, id));
     if (!trade) return reply.status(404).send({ error: 'Trade not found' });
@@ -123,14 +142,10 @@ export async function adminRoutes(app: FastifyInstance) {
     }
 
     if (trade.sellerId === PLATFORM_USER_ID) {
-      // Platform trade: advance to payment_confirmed first if needed, then complete
+      // Platform trade: advance through state machine, then complete
       if (trade.status === 'payment_sent') {
-        await db.update(trades).set({
-          status: 'payment_confirmed',
-          paymentConfirmedAt: new Date(),
-          holdingUntil: new Date(),
-          updatedAt: new Date(),
-        }).where(eq(trades.id, id));
+        const r1 = await transitionTrade(id, 'payment_confirmed', request.userId);
+        if (!r1.success) return reply.status(400).send({ error: r1.error });
       }
       await completePlatformSellTrade(id);
     } else {
@@ -163,20 +178,45 @@ export async function adminRoutes(app: FastifyInstance) {
 
   // ─── Full Trade List (Admin view, with buyer/seller names) ─────────
   app.get('/api/admin/trades', { preHandler: [adminGuard] }, async (request) => {
-    const query = request.query as { status?: string; limit?: string };
+    const query = request.query as { status?: string; limit?: string; offset?: string };
     const limit = Math.min(Number(query.limit) || 50, 200);
+    const offset = Math.max(Number(query.offset) || 0, 0);
 
-    const statusFilter = query.status ? sql`AND t.status = ${query.status}` : sql``;
+    const validatedStatus = query.status && VALID_TRADE_STATUSES.includes(query.status as any) ? query.status : undefined;
+    const statusFilter = validatedStatus ? sql`AND t.status = ${validatedStatus}` : sql``;
     const rows = await db.execute(
-      sql`SELECT t.*,
-                 b.email AS buyer_email, b.display_name AS buyer_display_name,
-                 s.email AS seller_email, s.display_name AS seller_display_name
+      sql`SELECT t.id, t.status,
+                 t.order_id        AS "orderId",
+                 t.buyer_id        AS "buyerId",
+                 t.seller_id       AS "sellerId",
+                 t.crypto_asset    AS "cryptoAsset",
+                 t.amount_crypto   AS "amountCrypto",
+                 t.amount_fiat     AS "amountFiat",
+                 t.price_per_unit  AS "pricePerUnit",
+                 t.fee_percent     AS "feePercent",
+                 t.fee_amount      AS "feeAmount",
+                 t.escrow_address  AS "escrowAddress",
+                 t.escrow_tx_id    AS "escrowTxId",
+                 t.release_tx_id   AS "releaseTxId",
+                 t.escrow_funded_at    AS "escrowFundedAt",
+                 t.payment_sent_at     AS "paymentSentAt",
+                 t.payment_confirmed_at AS "paymentConfirmedAt",
+                 t.crypto_released_at  AS "cryptoReleasedAt",
+                 t.completed_at   AS "completedAt",
+                 t.expires_at     AS "expiresAt",
+                 t.holding_until  AS "holdingUntil",
+                 t.created_at     AS "createdAt",
+                 t.updated_at     AS "updatedAt",
+                 b.email           AS "buyerEmail",
+                 b.display_name    AS "buyerDisplayName",
+                 s.email           AS "sellerEmail",
+                 s.display_name    AS "sellerDisplayName"
           FROM trades t
           LEFT JOIN users b ON b.id = t.buyer_id
           LEFT JOIN users s ON s.id = t.seller_id
           WHERE 1=1 ${statusFilter}
           ORDER BY t.created_at DESC
-          LIMIT ${limit}`,
+          LIMIT ${limit} OFFSET ${offset}`,
     ) as any;
     const tradeList = Array.isArray(rows) ? rows : rows?.rows ?? [];
 
@@ -208,8 +248,11 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ─── Wallet Key Recovery (Admin) ────────────────────────────────────
-  app.post('/api/admin/wallets/recover-key', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { walletId } = request.body as { walletId: string };
+  app.post('/api/admin/wallets/recover-key', {
+    config: { rateLimit: { max: 3, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { walletId } = recoverKeySchema.parse(request.body);
     if (!walletId) return reply.status(400).send({ error: 'walletId is required' });
 
     const [wallet] = await db
@@ -257,16 +300,17 @@ export async function adminRoutes(app: FastifyInstance) {
       .where(eq(balances.userId, PLATFORM_USER_ID));
 
     // Sum all fee credits from ledger
-    const [feeTotal] = await db.execute(
-      sql`SELECT asset, SUM(amount::numeric) as total_fees
+    const feeTotalResult = await db.execute(
+      sql`SELECT asset, SUM(amount::numeric) AS "totalFees"
           FROM balance_ledger
           WHERE user_id = ${PLATFORM_USER_ID} AND entry_type = 'fee_credit'
           GROUP BY asset`,
-    ) as any[] ?? [];
+    );
+    const feeTotals = (feeTotalResult as any).rows ?? feeTotalResult;
 
     return {
       balances: platformBalances,
-      feeTotals: feeTotal ?? [],
+      feeTotals,
     };
   });
 
@@ -315,10 +359,12 @@ export async function adminRoutes(app: FastifyInstance) {
 
     const conditions = [sql`${users.id} != ${PLATFORM_USER_ID}`];
     if (query.search) {
-      const pattern = `%${query.search}%`;
+      const search = query.search.slice(0, 100); // Cap search length
+      const pattern = `%${search}%`;
       conditions.push(sql`(${users.email} ILIKE ${pattern} OR ${users.displayName} ILIKE ${pattern})`);
     }
-    if (query.kycStatus) {
+    const VALID_KYC_STATUSES = ['pending', 'verified', 'rejected'];
+    if (query.kycStatus && VALID_KYC_STATUSES.includes(query.kycStatus)) {
       conditions.push(eq(users.kycStatus, query.kycStatus));
     }
 
@@ -353,7 +399,7 @@ export async function adminRoutes(app: FastifyInstance) {
 
   // ─── Single User Detail ───────────────────────────────────────────
   app.get('/api/admin/users/:id', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
+    const { id } = uuidParamSchema.parse(request.params);
 
     const [user] = await db
       .select({
@@ -411,12 +457,19 @@ export async function adminRoutes(app: FastifyInstance) {
       .orderBy(desc(orders.createdAt))
       .limit(20);
 
+    // Audit log for PII access
+    await db.insert(complianceLogs).values({
+      userId: request.userId,
+      eventType: 'admin_viewed_user_pii',
+      payload: { targetUserId: id },
+    });
+
     return { user, balances: userBalances, wallets: userWallets, recentTrades, orders: userOrders };
   });
 
   // ─── Single Trade Detail ──────────────────────────────────────────
   app.get('/api/admin/trades/:id', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
+    const { id } = uuidParamSchema.parse(request.params);
 
     const [trade] = await db.select().from(trades).where(eq(trades.id, id));
     if (!trade) return reply.status(404).send({ error: 'Trade not found' });
@@ -451,10 +504,12 @@ export async function adminRoutes(app: FastifyInstance) {
   app.get('/api/admin/withdrawals', { preHandler: [adminGuard] }, async (request) => {
     const query = request.query as { status?: string; limit?: string; offset?: string };
     const limit = Math.min(Number(query.limit) || 50, 200);
-    const offset = Number(query.offset) || 0;
+    const offset = Math.max(Number(query.offset) || 0, 0);
 
     const conditions = [];
-    if (query.status) conditions.push(eq(withdrawals.status, query.status));
+    if (query.status && VALID_WITHDRAWAL_STATUSES.includes(query.status as any)) {
+      conditions.push(eq(withdrawals.status, query.status));
+    }
 
     const rows = await db
       .select({
@@ -484,29 +539,41 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ─── Approve Withdrawal ───────────────────────────────────────────
-  app.post('/api/admin/withdrawals/:id/approve', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
+  app.post('/api/admin/withdrawals/:id/approve', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
 
-    const [withdrawal] = await db.select().from(withdrawals).where(eq(withdrawals.id, id));
-    if (!withdrawal) return reply.status(404).send({ error: 'Withdrawal not found' });
-    if (withdrawal.status !== 'pending_review') {
-      return reply.status(400).send({ error: `Cannot approve: status is "${withdrawal.status}", expected "pending_review"` });
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM withdrawals WHERE id = ${id} FOR UPDATE`);
+      const [withdrawal] = await tx.select().from(withdrawals).where(eq(withdrawals.id, id));
+      if (!withdrawal) return { error: 'Withdrawal not found', code: 404 } as const;
+      if (withdrawal.status !== 'pending_review') {
+        return { error: `Cannot approve: status is "${withdrawal.status}", expected "pending_review"`, code: 400 } as const;
+      }
+
+      await tx
+        .update(withdrawals)
+        .set({ status: 'approved', approvedAt: new Date() })
+        .where(eq(withdrawals.id, id));
+
+      return { success: true, withdrawal } as const;
+    });
+
+    if ('error' in result && 'code' in result) {
+      return reply.status(result.code as number).send({ error: result.error });
     }
-
-    await db
-      .update(withdrawals)
-      .set({ status: 'approved', approvedAt: new Date() })
-      .where(eq(withdrawals.id, id));
 
     await db.insert(complianceLogs).values({
       userId: request.userId,
       eventType: 'admin_withdrawal_approved',
       payload: {
         withdrawalId: id,
-        withdrawalUserId: withdrawal.userId,
-        asset: withdrawal.asset,
-        amount: withdrawal.amount,
-        toAddress: withdrawal.toAddress,
+        withdrawalUserId: result.withdrawal.userId,
+        asset: result.withdrawal.asset,
+        amount: result.withdrawal.amount,
+        toAddress: result.withdrawal.toAddress,
       },
     });
 
@@ -514,17 +581,21 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ─── Reject Withdrawal ────────────────────────────────────────────
-  app.post('/api/admin/withdrawals/:id/reject', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const { reason } = (request.body as { reason?: string }) ?? {};
+  app.post('/api/admin/withdrawals/:id/reject', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
+    const { reason } = rejectWithdrawalSchema.parse(request.body);
 
-    const [withdrawal] = await db.select().from(withdrawals).where(eq(withdrawals.id, id));
-    if (!withdrawal) return reply.status(404).send({ error: 'Withdrawal not found' });
-    if (withdrawal.status !== 'pending_review') {
-      return reply.status(400).send({ error: `Cannot reject: status is "${withdrawal.status}", expected "pending_review"` });
-    }
+    const result = await db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM withdrawals WHERE id = ${id} FOR UPDATE`);
+      const [withdrawal] = await tx.select().from(withdrawals).where(eq(withdrawals.id, id));
+      if (!withdrawal) return { error: 'Withdrawal not found', code: 404 } as const;
+      if (withdrawal.status !== 'pending_review') {
+        return { error: `Cannot reject: status is "${withdrawal.status}", expected "pending_review"`, code: 400 } as const;
+      }
 
-    await db.transaction(async (tx) => {
       // Refund the debited amount back to user's available balance
       await mutateBalance(tx, {
         userId: withdrawal.userId,
@@ -541,16 +612,22 @@ export async function adminRoutes(app: FastifyInstance) {
         .update(withdrawals)
         .set({ status: 'failed' })
         .where(eq(withdrawals.id, id));
+
+      return { success: true, withdrawal } as const;
     });
+
+    if ('error' in result && 'code' in result) {
+      return reply.status(result.code as number).send({ error: result.error });
+    }
 
     await db.insert(complianceLogs).values({
       userId: request.userId,
       eventType: 'admin_withdrawal_rejected',
       payload: {
         withdrawalId: id,
-        withdrawalUserId: withdrawal.userId,
-        asset: withdrawal.asset,
-        amount: withdrawal.amount,
+        withdrawalUserId: result.withdrawal.userId,
+        asset: result.withdrawal.asset,
+        amount: result.withdrawal.amount,
         reason: reason ?? null,
       },
     });
@@ -562,16 +639,31 @@ export async function adminRoutes(app: FastifyInstance) {
   app.get('/api/admin/orders', { preHandler: [adminGuard] }, async (request) => {
     const query = request.query as { status?: string; type?: string; asset?: string; limit?: string; offset?: string };
     const limit = Math.min(Number(query.limit) || 50, 200);
-    const offset = Number(query.offset) || 0;
+    const offset = Math.max(Number(query.offset) || 0, 0);
 
-    const filters: string[] = [];
-    const statusFilter = query.status ? sql`AND o.status = ${query.status}` : sql``;
-    const typeFilter = query.type ? sql`AND o.type = ${query.type}` : sql``;
-    const assetFilter = query.asset ? sql`AND o.crypto_asset = ${query.asset}` : sql``;
+    const validatedStatus = query.status && VALID_ORDER_STATUSES.includes(query.status as any) ? query.status : undefined;
+    const validatedType = query.type && VALID_ORDER_TYPES.includes(query.type as any) ? query.type : undefined;
+    const validatedAsset = query.asset && VALID_ASSETS.includes(query.asset as any) ? query.asset : undefined;
+    const statusFilter = validatedStatus ? sql`AND o.status = ${validatedStatus}` : sql``;
+    const typeFilter = validatedType ? sql`AND o.type = ${validatedType}` : sql``;
+    const assetFilter = validatedAsset ? sql`AND o.crypto_asset = ${validatedAsset}` : sql``;
 
     const rows = await db.execute(
-      sql`SELECT o.*,
-                 u.email AS user_email, u.display_name AS user_display_name
+      sql`SELECT o.id, o.type, o.status,
+                 o.user_id         AS "userId",
+                 o.crypto_asset    AS "cryptoAsset",
+                 o.amount_crypto   AS "amountCrypto",
+                 o.amount_fiat     AS "amountFiat",
+                 o.price_type      AS "priceType",
+                 o.price_premium   AS "pricePremium",
+                 o.fixed_price     AS "fixedPrice",
+                 o.min_trade       AS "minTrade",
+                 o.max_trade       AS "maxTrade",
+                 o.remaining_fiat  AS "remainingFiat",
+                 o.created_at      AS "createdAt",
+                 o.updated_at      AS "updatedAt",
+                 u.email           AS "userEmail",
+                 u.display_name    AS "userDisplayName"
           FROM orders o
           INNER JOIN users u ON u.id = o.user_id
           WHERE 1=1 ${statusFilter} ${typeFilter} ${assetFilter}
@@ -584,9 +676,12 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ─── Reject Payment (Admin reverts bad e-transfer) ────────────────
-  app.post('/api/admin/trades/:id/reject-payment', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const { reason } = (request.body as { reason?: string }) ?? {};
+  app.post('/api/admin/trades/:id/reject-payment', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
+    const { reason } = rejectPaymentSchema.parse(request.body);
 
     const [trade] = await db.select().from(trades).where(eq(trades.id, id));
     if (!trade) return reply.status(404).send({ error: 'Trade not found' });
@@ -618,50 +713,74 @@ export async function adminRoutes(app: FastifyInstance) {
   });
 
   // ─── Manual Match (Admin pairs buyer + seller) ────────────────────
-  app.post('/api/admin/orders/manual-match', { preHandler: [adminGuard] }, async (request, reply) => {
-    const { buyOrderId, sellOrderId } = request.body as { buyOrderId: string; sellOrderId: string };
+  app.post('/api/admin/orders/manual-match', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { buyOrderId, sellOrderId } = manualMatchSchema.parse(request.body);
     if (!buyOrderId || !sellOrderId) {
       return reply.status(400).send({ error: 'buyOrderId and sellOrderId are required' });
     }
 
-    const [buyOrder] = await db.select().from(orders).where(eq(orders.id, buyOrderId));
-    const [sellOrder] = await db.select().from(orders).where(eq(orders.id, sellOrderId));
+    // Read orders with FOR UPDATE inside transaction to prevent concurrent modification
+    const matchResult = await db.transaction(async (tx) => {
+      const buyRows = await tx.execute(
+        sql`SELECT * FROM orders WHERE id = ${buyOrderId} FOR UPDATE`,
+      ) as any;
+      const sellRows = await tx.execute(
+        sql`SELECT * FROM orders WHERE id = ${sellOrderId} FOR UPDATE`,
+      ) as any;
 
-    if (!buyOrder) return reply.status(404).send({ error: 'Buy order not found' });
-    if (!sellOrder) return reply.status(404).send({ error: 'Sell order not found' });
-    if (buyOrder.status !== 'active') return reply.status(400).send({ error: `Buy order is "${buyOrder.status}", must be active` });
-    if (sellOrder.status !== 'active') return reply.status(400).send({ error: `Sell order is "${sellOrder.status}", must be active` });
-    if (buyOrder.type !== 'buy') return reply.status(400).send({ error: 'First order must be a buy order' });
-    if (sellOrder.type !== 'sell') return reply.status(400).send({ error: 'Second order must be a sell order' });
-    if (buyOrder.cryptoAsset !== sellOrder.cryptoAsset) {
-      return reply.status(400).send({ error: `Asset mismatch: buy=${buyOrder.cryptoAsset}, sell=${sellOrder.cryptoAsset}` });
-    }
-    if (buyOrder.userId === sellOrder.userId) {
-      return reply.status(400).send({ error: 'Cannot match orders from the same user' });
+      const buyOrder = (Array.isArray(buyRows) ? buyRows : buyRows?.rows ?? [])[0] as typeof orders.$inferSelect | undefined;
+      const sellOrder = (Array.isArray(sellRows) ? sellRows : sellRows?.rows ?? [])[0] as typeof orders.$inferSelect | undefined;
+
+      if (!buyOrder) return { error: 'Buy order not found', status: 404 } as const;
+      if (!sellOrder) return { error: 'Sell order not found', status: 404 } as const;
+      if (buyOrder.status !== 'active') return { error: `Buy order is "${buyOrder.status}", must be active`, status: 400 } as const;
+      if (sellOrder.status !== 'active') return { error: `Sell order is "${sellOrder.status}", must be active`, status: 400 } as const;
+      if (buyOrder.type !== 'buy') return { error: 'First order must be a buy order', status: 400 } as const;
+      if (sellOrder.type !== 'sell') return { error: 'Second order must be a sell order', status: 400 } as const;
+      if (buyOrder.cryptoAsset !== sellOrder.cryptoAsset) return { error: `Asset mismatch: buy=${buyOrder.cryptoAsset}, sell=${sellOrder.cryptoAsset}`, status: 400 } as const;
+      if (buyOrder.userId === sellOrder.userId) return { error: 'Cannot match orders from the same user', status: 400 } as const;
+
+      return { buyOrder, sellOrder } as const;
+    });
+
+    if ('error' in matchResult) {
+      return reply.status(matchResult.status as number).send({ error: matchResult.error });
     }
 
+    const { buyOrder, sellOrder } = matchResult;
     const asset = sellOrder.cryptoAsset;
 
-    // Resolve price from seller's terms
+    // Resolve price from seller's terms using Decimal for precision
     const priceData = await getPrice(asset);
     if (!priceData) return reply.status(400).send({ error: `No price data for ${asset}` });
 
     let pricePerUnit: number;
     if (sellOrder.priceType === 'fixed' && sellOrder.fixedPrice) {
-      pricePerUnit = Number(sellOrder.fixedPrice);
+      pricePerUnit = new Decimal(sellOrder.fixedPrice).toNumber();
     } else {
       const premium = new Decimal(sellOrder.pricePremium ?? 0);
       pricePerUnit = new Decimal(priceData.cadPrice).times(premium.dividedBy(100).plus(1)).toNumber();
     }
 
-    // Fill amount = min of both remaining + random cents for e-transfer disambiguation
-    const fillFiat = Math.min(Number(buyOrder.remainingFiat), Number(sellOrder.remainingFiat));
-    const randomCents = Math.floor(Math.random() * 99) / 100;
-    const finalFiat = new Decimal(fillFiat).plus(randomCents).toNumber();
+    // Fill amount = min of both remaining (using Decimal) + random cents for e-transfer disambiguation
+    const fillFiat = Decimal.min(
+      new Decimal(buyOrder.remainingFiat),
+      new Decimal(sellOrder.remainingFiat),
+    );
+    const randomCents = new Decimal(Math.floor(Math.random() * 99) + 1).dividedBy(100);
+    const maxAllowed = Decimal.min(
+      new Decimal(buyOrder.remainingFiat),
+      new Decimal(sellOrder.remainingFiat),
+    );
+    const finalFiat = Decimal.min(fillFiat.plus(randomCents), maxAllowed).toDecimalPlaces(2).toNumber();
     const amountCrypto = new Decimal(finalFiat).dividedBy(pricePerUnit).toDecimalPlaces(8).toNumber();
 
     const feePercent = env.TAKER_FEE_PERCENT;
-    const feeAmount = new Decimal(amountCrypto).times(feePercent).dividedBy(100).toDecimalPlaces(8).toNumber();
+    // Total fee = feePerSide * 2 (buyer side + seller side), consistent with matching engine
+    const feeAmount = new Decimal(amountCrypto).times(feePercent).dividedBy(100).times(2).toDecimalPlaces(8, Decimal.ROUND_UP).toNumber();
 
     const match: TradeMatch = {
       orderId: sellOrder.id,
@@ -702,7 +821,7 @@ export async function adminRoutes(app: FastifyInstance) {
   app.get('/api/admin/compliance-logs', { preHandler: [adminGuard] }, async (request) => {
     const query = request.query as { eventType?: string; limit?: string; offset?: string };
     const limit = Math.min(Number(query.limit) || 50, 200);
-    const offset = Number(query.offset) || 0;
+    const offset = Math.max(Number(query.offset) || 0, 0);
 
     const conditions = [];
     if (query.eventType) conditions.push(eq(complianceLogs.eventType, query.eventType));
@@ -716,5 +835,265 @@ export async function adminRoutes(app: FastifyInstance) {
       .offset(offset);
 
     return { logs };
+  });
+
+  // ─── Auth Events ────────────────────────────────────────────────────
+  app.get('/api/admin/auth-events', { preHandler: [adminGuard] }, async (request) => {
+    const query = request.query as { userId?: string; eventType?: string; success?: string; limit?: string; offset?: string };
+    const limit = Math.min(parseInt(query.limit || '50'), 100);
+    const offset = Math.max(parseInt(query.offset || '0'), 0);
+
+    const conditions: any[] = [];
+    if (query.userId) conditions.push(eq(authEvents.userId, query.userId));
+    if (query.eventType) conditions.push(eq(authEvents.eventType, query.eventType));
+    if (query.success === 'true') conditions.push(eq(authEvents.success, true));
+    if (query.success === 'false') conditions.push(eq(authEvents.success, false));
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const [events, countResult] = await Promise.all([
+      db.select({
+        id: authEvents.id,
+        userId: authEvents.userId,
+        eventType: authEvents.eventType,
+        ipAddress: authEvents.ipAddress,
+        userAgent: authEvents.userAgent,
+        success: authEvents.success,
+        metadata: authEvents.metadata,
+        createdAt: authEvents.createdAt,
+      })
+        .from(authEvents)
+        .where(whereClause)
+        .orderBy(desc(authEvents.createdAt))
+        .limit(limit)
+        .offset(offset),
+      db.select({ count: sql<number>`count(*)::int` })
+        .from(authEvents)
+        .where(whereClause),
+    ]);
+
+    return { events, total: countResult[0]?.count ?? 0 };
+  });
+
+  // ─── KYC Status Management ──────────────────────────────────────────
+  app.post('/api/admin/users/:id/kyc-status', { preHandler: [adminGuard] }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
+    const body = kycStatusSchema.parse(request.body);
+
+    // Atomic: row lock + state validation + update inside transaction
+    const result = await db.transaction(async (tx) => {
+      const lockResult = await tx.execute(
+        sql`SELECT kyc_status FROM users WHERE id = ${id} FOR UPDATE`,
+      ) as any;
+      const rows = Array.isArray(lockResult) ? lockResult : lockResult?.rows ?? [];
+      if (rows.length === 0) return { error: 'User not found', code: 404 } as const;
+
+      const currentStatus = rows[0].kyc_status as string;
+
+      // Validate state transition
+      if (body.status === 'verified' && currentStatus === 'verified') {
+        return { error: 'User is already verified', code: 409 } as const;
+      }
+
+      await tx.update(users).set({ kycStatus: body.status, updatedAt: new Date() }).where(eq(users.id, id));
+
+      return { success: true, previousStatus: currentStatus } as const;
+    });
+
+    if ('error' in result && 'code' in result) {
+      return reply.status(result.code as number).send({ error: result.error });
+    }
+
+    // Log to compliance (userId = admin who performed the action)
+    await db.insert(complianceLogs).values({
+      userId: request.userId,
+      eventType: body.status === 'verified' ? 'kyc_approved' : 'kyc_rejected',
+      payload: { targetUserId: id, note: body.note || null, previousStatus: result.previousStatus },
+    });
+
+    return { success: true, kycStatus: body.status };
+  });
+
+  // ─── KYC Documents ──────────────────────────────────────────────────
+  app.get('/api/admin/users/:id/kyc-documents', { preHandler: [adminGuard] }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
+    const docs = await db.select().from(kycDocuments).where(eq(kycDocuments.userId, id)).orderBy(desc(kycDocuments.uploadedAt));
+    return { documents: docs };
+  });
+
+  // ─── Staking Admin ──────────────────────────────────────────────────
+  app.get('/api/admin/staking/positions', { preHandler: [adminGuard] }, async (request) => {
+    const query = request.query as { userId?: string; asset?: string; status?: string; limit?: string; offset?: string };
+    const limit = Math.min(parseInt(query.limit || '50'), 100);
+    const offset = Math.max(parseInt(query.offset || '0'), 0);
+
+    const conditions: any[] = [];
+    if (query.userId) conditions.push(eq(stakingPositions.userId, query.userId));
+    if (query.asset) conditions.push(eq(stakingPositions.asset, query.asset));
+    if (query.status) conditions.push(eq(stakingPositions.status, query.status));
+
+    const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
+
+    const positions = await db.select({
+      id: stakingPositions.id,
+      userId: stakingPositions.userId,
+      asset: stakingPositions.asset,
+      amount: stakingPositions.amount,
+      allocationPercent: stakingPositions.allocationPercent,
+      status: stakingPositions.status,
+      totalEarned: stakingPositions.totalEarned,
+      startedAt: stakingPositions.startedAt,
+      maturesAt: stakingPositions.maturesAt,
+      lastAccrualAt: stakingPositions.lastAccrualAt,
+      productId: stakingPositions.productId,
+      apyPercent: stakingProducts.apyPercent,
+      term: stakingProducts.term,
+      lockDays: stakingProducts.lockDays,
+      userEmail: users.email,
+    })
+      .from(stakingPositions)
+      .leftJoin(stakingProducts, eq(stakingPositions.productId, stakingProducts.id))
+      .leftJoin(users, eq(stakingPositions.userId, users.id))
+      .where(whereClause)
+      .orderBy(desc(stakingPositions.startedAt))
+      .limit(limit)
+      .offset(offset);
+
+    return { positions };
+  });
+
+  app.get('/api/admin/staking/summary', { preHandler: [adminGuard] }, async () => {
+    const result = await db.execute(sql`
+      SELECT
+        COUNT(*)::int AS "totalPositions",
+        COUNT(*) FILTER (WHERE status = 'active')::int AS "activePositions",
+        COALESCE(SUM(CASE WHEN status = 'active' THEN total_earned::numeric ELSE 0 END), 0)::text AS "totalEarningsPaid"
+      FROM staking_positions
+    `);
+    const row = (result as any).rows?.[0] ?? result[0] ?? {};
+
+    const byAsset = await db.execute(sql`
+      SELECT asset, SUM(amount::numeric)::text AS "totalStaked", COUNT(*)::int AS positions
+      FROM staking_positions WHERE status = 'active'
+      GROUP BY asset ORDER BY asset
+    `);
+
+    return {
+      totalPositions: row.totalPositions ?? 0,
+      activePositions: row.activePositions ?? 0,
+      totalEarningsPaid: row.totalEarningsPaid ?? '0',
+      byAsset: (byAsset as any).rows ?? byAsset,
+    };
+  });
+
+  // ─── Manual Deposit Credit (Admin) ─────────────────────────────────
+  app.post('/api/admin/deposits/:id/manual-credit', {
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
+
+    const result = await db.transaction(async (tx) => {
+      // Lock the deposit row
+      const lockResult = await tx.execute(
+        sql`SELECT * FROM deposits WHERE id = ${id} FOR UPDATE`,
+      ) as any;
+      const rows = Array.isArray(lockResult) ? lockResult : lockResult?.rows ?? [];
+      if (rows.length === 0) return { error: 'Deposit not found', code: 404 } as const;
+
+      const deposit = rows[0] as any;
+
+      // Only allow manual credit for confirmed deposits that haven't been credited yet
+      if (deposit.status === 'credited') {
+        return { error: 'Deposit already credited', code: 400 } as const;
+      }
+      if (!['pending', 'confirming', 'confirmed'].includes(deposit.status)) {
+        return { error: `Cannot credit deposit with status "${deposit.status}"`, code: 400 } as const;
+      }
+
+      // Mark as confirmed + credited
+      await tx.execute(
+        sql`UPDATE deposits SET status = 'credited', confirmed_at = NOW(), credited_at = NOW() WHERE id = ${id}`,
+      );
+
+      // Clear any pending deposit balance (idempotent)
+      await mutateBalance(tx, {
+        userId: deposit.user_id,
+        asset: deposit.asset,
+        field: 'pendingDeposit',
+        amount: new Decimal(deposit.amount).negated().toFixed(18),
+        entryType: 'deposit_pending_cleared',
+        idempotencyKey: `deposit:${id}:clear_pending`,
+        depositId: id,
+        note: `Admin manual credit: cleared pending`,
+      });
+
+      // Credit available balance
+      await mutateBalance(tx, {
+        userId: deposit.user_id,
+        asset: deposit.asset,
+        field: 'available',
+        amount: deposit.amount,
+        entryType: 'deposit_confirmed',
+        idempotencyKey: `deposit:${id}:credit`,
+        depositId: id,
+        note: `Admin manual credit: ${deposit.amount} ${deposit.asset}`,
+      });
+
+      // Notify user
+      await tx.insert(notifications).values({
+        userId: deposit.user_id,
+        type: 'deposit_confirmed',
+        title: 'Deposit Confirmed',
+        message: `Your deposit of ${deposit.amount} ${deposit.asset} has been confirmed and credited to your account.`,
+        metadata: { asset: deposit.asset, amount: deposit.amount, txHash: deposit.tx_hash },
+      });
+
+      return { success: true, userId: deposit.user_id, asset: deposit.asset, amount: deposit.amount } as const;
+    });
+
+    if ('error' in result && 'code' in result) {
+      return reply.status(result.code as number).send({ error: result.error });
+    }
+
+    // Audit log
+    await db.insert(complianceLogs).values({
+      userId: request.userId,
+      eventType: 'admin_manual_deposit_credit',
+      payload: { depositId: id, creditedUserId: result.userId, asset: result.asset, amount: result.amount },
+    });
+
+    return { success: true, message: `Deposit of ${result.amount} ${result.asset} credited to user.` };
+  });
+
+  // ─── Skip Holding Period (Admin fast-tracks trade completion) ──────
+  app.post('/api/admin/trades/:id/skip-holding', {
+    config: { rateLimit: { max: 20, timeWindow: '1 minute' } },
+    preHandler: [adminGuard],
+  }, async (request, reply) => {
+    const { id } = uuidParamSchema.parse(request.params);
+
+    const [trade] = await db.select().from(trades).where(eq(trades.id, id));
+    if (!trade) return reply.status(404).send({ error: 'Trade not found' });
+
+    if (trade.status !== 'payment_confirmed') {
+      return reply.status(400).send({ error: `Trade is at "${trade.status}", expected payment_confirmed` });
+    }
+
+    // Set holdingUntil to now so the next processExpiredTrades cycle completes it
+    await db
+      .update(trades)
+      .set({ holdingUntil: new Date(), updatedAt: new Date() })
+      .where(eq(trades.id, id));
+
+    // Audit log
+    await db.insert(complianceLogs).values({
+      userId: request.userId,
+      tradeId: id,
+      eventType: 'admin_skip_holding_period',
+      payload: { tradeId: id, buyerId: trade.buyerId, sellerId: trade.sellerId },
+    });
+
+    return { success: true, message: 'Holding period skipped. Trade will complete on next processing cycle.' };
   });
 }

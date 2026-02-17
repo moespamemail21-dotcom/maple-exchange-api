@@ -23,10 +23,19 @@ interface PriceData {
   high24h?: number;
   low24h?: number;
   volume24h?: number;
+  sparkline?: number[];
   lastUpdated: string;
 }
 
+const SYMBOL_TO_MEXC: Record<string, string> = {
+  BTC: 'BTCUSDT', ETH: 'ETHUSDT', LTC: 'LTCUSDT',
+  XRP: 'XRPUSDT', SOL: 'SOLUSDT', LINK: 'LINKUSDT',
+};
+
 let priceCache: Map<string, PriceData> = new Map();
+let sparklineCache: Map<string, number[]> = new Map();
+let sparklineLastFetch: Date | null = null;
+const SPARKLINE_REFRESH_MS = 5 * 60 * 1000; // refresh every 5 min
 let lastSuccessfulFetch: Date | null = null;
 const MAX_STALENESS_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -131,26 +140,81 @@ export async function getPrices(symbols: string[]): Promise<Map<string, PriceDat
 }
 
 /**
+ * Fetch 1h klines from MEXC REST API for all symbols.
+ * Cached in memory, refreshed every 5 minutes.
+ */
+async function refreshSparklines(): Promise<void> {
+  if (sparklineLastFetch && Date.now() - sparklineLastFetch.getTime() < SPARKLINE_REFRESH_MS) {
+    return; // still fresh
+  }
+
+  // Fetch CAD rate from Redis or default
+  let cadRate = 1.36;
+  try {
+    const usdtPrice = await redis.get(KEYS.price('USDT'));
+    if (usdtPrice) {
+      const parsed = JSON.parse(usdtPrice);
+      if (parsed.cadPrice > 0) cadRate = parsed.cadPrice;
+    }
+  } catch {}
+
+  const symbols = Object.keys(SYMBOL_TO_MEXC);
+  await Promise.all(symbols.map(async (symbol) => {
+    const pair = SYMBOL_TO_MEXC[symbol];
+    if (!pair) return;
+    try {
+      const { data } = await axios.get('https://api.mexc.com/api/v3/klines', {
+        params: { symbol: pair, interval: '60m', limit: 48 },
+        timeout: 8000,
+      });
+      if (!Array.isArray(data) || data.length === 0) return;
+      // Each kline: [openTime, open, high, low, close, volume, closeTime, quoteVolume]
+      const points = data.map((c: any[]) => parseFloat(c[4]) * cadRate);
+      sparklineCache.set(symbol, points);
+    } catch {
+      // Keep old data on failure
+    }
+  }));
+
+  sparklineLastFetch = new Date();
+  logger.debug({ symbols: sparklineCache.size }, 'Sparkline cache refreshed from MEXC');
+}
+
+/**
  * Return all cached prices without hitting external APIs.
+ * Attaches sparkline data from MEXC kline cache.
  * Used by GET /api/prices so user requests never trigger CoinGecko calls.
  */
 export async function getAllPricesCached(): Promise<PriceData[]> {
   const allSymbols = Object.values(ASSET_SYMBOLS);
-  const keys = allSymbols.map((s) => KEYS.price(s));
-  const cached = await redis.mget(...keys);
+  const priceKeys = allSymbols.map((s) => KEYS.price(s));
+  const priceValues = await redis.mget(...priceKeys);
+
+  // Refresh sparklines in background (non-blocking after first call)
+  await refreshSparklines();
 
   const results: PriceData[] = [];
   for (let i = 0; i < allSymbols.length; i++) {
-    if (cached[i]) {
-      results.push(JSON.parse(cached[i]!));
+    let priceData: PriceData | null = null;
+
+    if (priceValues[i]) {
+      priceData = JSON.parse(priceValues[i]!);
     } else {
-      // Fallback to memory cache
       const assetId = Object.entries(ASSET_SYMBOLS).find(([_, s]) => s === allSymbols[i])?.[0];
       if (assetId) {
-        const mem = priceCache.get(assetId);
-        if (mem) results.push(mem);
+        priceData = priceCache.get(assetId) ?? null;
       }
     }
+
+    if (!priceData) continue;
+
+    // Attach sparkline from MEXC kline cache
+    const sparkline = sparklineCache.get(allSymbols[i]);
+    if (sparkline && sparkline.length > 0) {
+      priceData.sparkline = sparkline;
+    }
+
+    results.push(priceData);
   }
   return results;
 }

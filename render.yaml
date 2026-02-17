@@ -33,8 +33,18 @@ services:
           type: redis
           property: connectionString
       - key: JWT_SECRET
-        generateValue: true
+        sync: false
       - key: WALLET_ENCRYPTION_KEY
-        generateValue: true
+        sync: false
+      - key: WALLET_SEED_BTC
+        sync: false
+      - key: WALLET_SEED_ETH
+        sync: false
+      - key: WALLET_SEED_LTC
+        sync: false
+      - key: WALLET_SEED_XRP
+        sync: false
+      - key: WALLET_SEED_SOL
+        sync: false
       - key: STORAGE_BACKEND
         value: local
